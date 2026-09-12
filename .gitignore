@@ -1,0 +1,13 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# Pinned reference checkouts (restored by tools/fetch-reference.sh; never
+# committed).
+.reference/
+
+# Editor/tooling droppings
+*.o
+*.a
+.DS_Store
