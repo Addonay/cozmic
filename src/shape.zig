@@ -1456,7 +1456,6 @@ pub fn splitSpanWords(
     span_abs_start: usize,
     attrs: *const AttrsList,
 ) ShapeError![]WordSplit {
-    _ = attrs; // Span font comes from `font`; per-run attrs apply at shaping.
     var words: std.ArrayList(WordSplit) = .empty;
     errdefer words.deinit(alloc);
 
@@ -1471,7 +1470,19 @@ pub fn splitSpanWords(
         if (end_lb > 0 and end_lb < span.len) {
             const pre = decodeOneRev(span, end_lb);
             const post = decodeOne(span, end_lb).cp;
-            if (probeKeepsPair(adapter, font, pre, post)) continue;
+            if (isAsciiPunct(pre) and isAsciiPunct(post)) {
+                // Probe with the font that actually renders this position:
+                // upstream resolves `attrs_list.get_span(start_idx + end_lb)`
+                // through `get_font_matches` before shaping the probe text,
+                // while this port probed with the span primary and dropped
+                // `attrs`. Probing the primary split pairs like `|>` whenever
+                // the primary face lacked the contextual alternate the span's
+                // own family carries (e.g. Inter's `|>` calt behind a Fira
+                // Mono primary).
+                const probe_attrs = attrs.get_span(span_abs_start + end_lb);
+                const probe_font = adapter.fontFor(fontQueryFor(probe_attrs)) orelse font;
+                if (probeKeepsPair(adapter, probe_font, pre, post)) continue;
+            }
         }
         // Peel trailing blanks (shape.rs:1062-1073).
         var start_lb = end_lb;

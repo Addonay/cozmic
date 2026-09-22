@@ -4,8 +4,10 @@ zig-out/
 zig-pkg/
 
 # Pinned reference checkouts (restored by tools/fetch-reference.sh; never
-# committed).
+# committed). The trailing-slash form only matches real directories, so the
+# symlink form is listed explicitly too.
 .reference/
+/.reference
 
 # Editor/tooling droppings
 *.o
