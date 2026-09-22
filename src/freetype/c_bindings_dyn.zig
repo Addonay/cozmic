@@ -4003,6 +4003,7 @@ pub const required_symbols = [_][]const u8{
     "FT_MulFix",
     "FT_New_Face",
     "FT_New_Memory_Face",
+    "FT_Outline_Decompose",
     "FT_Reference_Face",
     "FT_Render_Glyph",
     "FT_Select_Charmap",

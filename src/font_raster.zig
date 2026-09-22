@@ -40,6 +40,10 @@ const std = @import("std");
 const raster_ft = @import("raster_ft.zig");
 const glyph_cache = @import("glyph_cache.zig");
 const font_system = @import("font_system.zig");
+/// Outline command type (type-only back-reference; `swash_cache` imports this
+/// file for the `Raster` field, and neither layout depends on the other —
+/// Zig resolves the accepted cycle, see raster_ft.zig).
+const swash_cache_mod = @import("swash_cache.zig");
 
 /// Upper bound for lazily reading a single font file (64 MiB), matching the
 /// other font readers in this port.
@@ -355,6 +359,25 @@ pub const Raster = struct {
             y_offset,
             fake_italic,
         );
+    }
+
+    /// Outline commands for one glyph: the real (FreeType) backend behind
+    /// `SwashCache.getOutline` — face resolve, `wght` variation, then
+    /// decomposition (px, y-up, unhinted; FAKE_ITALIC skew applied). Returns
+    /// null when the face is missing or the glyph has no scalable outline;
+    /// `error.OutOfMemory` propagates (never a partial command list).
+    pub fn outlineCommands(
+        self: *Raster,
+        alloc: std.mem.Allocator,
+        font_id: u32,
+        glyph_id: u16,
+        font_size: f32,
+        weight: u16,
+        flags: glyph_cache.CacheKeyFlags,
+    ) !?[]swash_cache_mod.OutlineCommand {
+        const face = (try self.ensureFace(font_id)) orelse return null;
+        try face.setVariationWght(weight);
+        return try face.outlineCommands(alloc, glyph_id, font_size, flags.contains(glyph_cache.CacheKeyFlags.FAKE_ITALIC));
     }
 
     fn makeEntry(self: *Raster, font_id: u32, bytes: []const u8, index: i32) !FaceEntry {

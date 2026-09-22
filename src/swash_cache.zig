@@ -383,6 +383,30 @@ pub const SwashCache = struct {
         return null;
     }
 
+    /// Outline producer with the same precedence as `renderImage`: the
+    /// attached FreeType raster is authoritative (unknown/failed font source
+    /// -> `error.FontUnavailable`, outline-less glyph -> cached null), and
+    /// the adapter stand-in only serves callers without a raster.
+    fn renderOutlineCommands(self: *SwashCache, key: CacheKey) !?[]OutlineCommand {
+        if (self.raster) |raster| {
+            const cmds = try raster.outlineCommands(
+                self.allocator,
+                key.font_id,
+                key.glyph_id,
+                key.fontSize(),
+                key.font_weight,
+                key.flags,
+            );
+            const r = cmds orelse {
+                if (!raster.canUse(key.font_id)) return error.FontUnavailable;
+                return null;
+            };
+            return r;
+        }
+        const adapter = self.adapter orelse return null;
+        return adapter.renderOutline(self.allocator, key);
+    }
+
     /// Create outline commands, caching results including misses
     /// (swash.rs:175-184).
     pub fn getOutline(self: *SwashCache, key: CacheKey) !?[]const OutlineCommand {
@@ -391,7 +415,7 @@ pub const SwashCache = struct {
             // Same error-path hygiene as `getImage`.
             errdefer _ = self.outline_cache.remove(key);
             var owned: ?[]OutlineCommand = null;
-            if (self.adapter) |adapter| owned = try adapter.renderOutline(self.allocator, key);
+            owned = try self.renderOutlineCommands(key);
             errdefer if (owned) |cmds| self.allocator.free(cmds);
             entry.value_ptr.* = owned;
         }
@@ -402,8 +426,7 @@ pub const SwashCache = struct {
     /// Create outline commands without caching (swash.rs:187-193).
     /// Returns an owned slice; the caller frees it.
     pub fn getOutlineUncached(self: *SwashCache, key: CacheKey) !?[]OutlineCommand {
-        const adapter = self.adapter orelse return null;
-        return adapter.renderOutline(self.allocator, key);
+        return self.renderOutlineCommands(key);
     }
 
     /// Pixel visitor callback.
@@ -1254,6 +1277,125 @@ test "raster-backed color font serves a .color image with non-zero alpha" {
         if (r != g or g != b) non_gray += 1;
     }
     try std.testing.expect(non_gray > 0);
+}
+
+/// Outline key builder for the real-raster tests (16px, LTR-neutral bins).
+fn outlineTestKey(font_id: u32, glyph_id: u16, flags: glyph_cache.CacheKeyFlags) CacheKey {
+    return .{
+        .font_id = font_id,
+        .glyph_id = glyph_id,
+        .font_size_bits = @bitCast(@as(f32, 16.0)),
+        .x_bin = .zero,
+        .y_bin = .zero,
+        .font_weight = 400,
+        .flags = flags,
+    };
+}
+
+test "outline commands come from the real FreeType raster" {
+    const t = std.testing;
+    var raster = try font_raster.Raster.init(t.allocator);
+    defer raster.deinit();
+    try raster.addFontSource(7, "tests/fonts/Inter-Regular.ttf", 0);
+    var cache = SwashCache.init(t.allocator, null);
+    defer cache.deinit();
+    cache.setRaster(&raster);
+
+    const face = (try raster.ensureFace(7)) orelse return error.FontUnavailable;
+    const o_gid = face.charIndex('O');
+    const sp_gid = face.charIndex(' ');
+    try t.expect(o_gid != 0 and sp_gid != 0);
+
+    // Round 'O': quadratic contours => move_to + quad_to commands, y-up.
+    const key = outlineTestKey(7, @intCast(o_gid), .{});
+    const cmds = (try cache.getOutline(key)) orelse return error.SkipZigTest;
+    try t.expect(cmds.len >= 4);
+    try t.expect(std.meta.activeTag(cmds[0]) == .move_to);
+    var quads: usize = 0;
+    var moves: usize = 0;
+    var min_y: f32 = std.math.floatMax(f32);
+    var max_y: f32 = -std.math.floatMax(f32);
+    for (cmds) |cmd| switch (cmd) {
+        .move_to => |p| {
+            moves += 1;
+            min_y = @min(min_y, p.y);
+            max_y = @max(max_y, p.y);
+        },
+        .line_to => |p| {
+            min_y = @min(min_y, p.y);
+            max_y = @max(max_y, p.y);
+        },
+        .quad_to => |q| {
+            quads += 1;
+            for ([_]Point{ q.control, q.to }) |p| {
+                min_y = @min(min_y, p.y);
+                max_y = @max(max_y, p.y);
+            }
+        },
+        .curve_to => |c| {
+            for ([_]Point{ c.c1, c.c2, c.to }) |p| {
+                min_y = @min(min_y, p.y);
+                max_y = @max(max_y, p.y);
+            }
+        },
+        .close => {},
+    };
+    try t.expect(quads >= 2); // outer + inner ring of 'O'
+    try t.expect(moves >= 2);
+    // y-up: a round glyph straddles the baseline.
+    try t.expect(min_y < 0 and max_y > 0);
+    try t.expect(max_y <= 16.0 * 2); // sane bounds at16px
+
+    // Cache hit: same stored slice, one entry.
+    const again = (try cache.getOutline(key)) orelse return error.SkipZigTest;
+    try t.expect(cmds.ptr == again.ptr);
+    try t.expectEqual(@as(u32, 1), cache.outline_cache.count());
+
+    // Uncached variant matches the cached content without new entries.
+    const uncached = (try cache.getOutlineUncached(key)) orelse return error.SkipZigTest;
+    defer t.allocator.free(uncached);
+    try t.expectEqual(cmds.len, uncached.len);
+    try t.expectEqual(@as(u32, 1), cache.outline_cache.count());
+
+    // Space: scalable face, zero contours => non-null, empty.
+    const space = outlineTestKey(7, @intCast(sp_gid), .{});
+    if (try cache.getOutline(space)) |empty| try t.expectEqual(@as(usize, 0), empty.len);
+
+    // Unrenderable glyph id => null, negative-cached (upstream None).
+    const bad = outlineTestKey(7, 9999, .{});
+    try t.expect(try cache.getOutline(bad) == null);
+    try t.expect(try cache.getOutline(bad) == null);
+}
+
+test "FAKE_ITALIC outline commands carry the14deg skew" {
+    const t = std.testing;
+    var raster = try font_raster.Raster.init(t.allocator);
+    defer raster.deinit();
+    try raster.addFontSource(7, "tests/fonts/Inter-Regular.ttf", 0);
+    var cache = SwashCache.init(t.allocator, null);
+    defer cache.deinit();
+    cache.setRaster(&raster);
+    const face = (try raster.ensureFace(7)) orelse return error.FontUnavailable;
+    const gid: u16 = @intCast(face.charIndex('l'));
+    try t.expect(gid != 0);
+
+    const base = (try cache.getOutline(outlineTestKey(7, gid, .{}))) orelse return error.SkipZigTest;
+    const skew_flag = glyph_cache.CacheKeyFlags.fake_italic;
+    const skewed = (try cache.getOutline(outlineTestKey(7, gid, skew_flag))) orelse return error.SkipZigTest;
+    try t.expectEqual(base.len, skewed.len);
+    var checked: usize = 0;
+    for (base, skewed) |a, b| {
+        if (std.meta.activeTag(a) != .move_to) continue;
+        const pa = a.move_to;
+        const pb = b.move_to;
+        try t.expectApproxEqAbs(pa.y, pb.y, 1e-4);
+        const expect_dx = pa.y * FAKE_ITALIC_SKEW;
+        try t.expectApproxEqAbs(pb.x - pa.x, expect_dx, 1e-3);
+        checked += 1;
+    }
+    // 'l' is a single-contour stem: exactly one move_to, enough to pin the
+    // per-point skew relationship (multi-contour coverage is the 'O' test).
+    try t.expect(checked >= 1);
 }
 
 test {

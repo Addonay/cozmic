@@ -40,6 +40,12 @@ const ft = @import("freetype");
 /// Vendored translate-c bindings (same names an `@cImport` would have made).
 const c = ft.c;
 
+/// Outline command type (the swash-zeno mirror) lives in `swash_cache.zig`.
+/// This is a type-only back-reference: `swash_cache` reaches this file via
+/// `font_raster`, and neither struct's *layout* depends on the other, so Zig
+/// resolves the cycle (same accepted pattern as shape_run_cache <-> shape).
+const swash_cache_mod = @import("swash_cache.zig");
+
 // ---------------------------------------------------------------------------
 // Public constants (`FT_LOAD_*`, `FT_RENDER_MODE_*`, `FT_PIXEL_MODE_*`)
 // ---------------------------------------------------------------------------
@@ -478,6 +484,52 @@ pub const Face = struct {
         return snapshot(slot);
     }
 
+    /// Decompose this glyph's outline into pixel-space, y-up path commands —
+    /// the equivalent of swash's `scale_outline(...).path().commands()` that
+    /// upstream's `get_outline_commands` returns. Unhinted vector geometry
+    /// (swash scales outlines; hinting there only affects raster coverage),
+    /// `FAKE_ITALIC` applies the same14° skew as the raster path, and the
+    /// `wght` variation must already be set by the caller (see
+    /// `font_raster.Raster.outlineCommands`).
+    ///
+    /// Returns `null` when the glyph has no scalable outline (bitmap-only
+    /// strikes, unrenderable glyph ids — upstream's `None`) and an empty
+    /// slice for a face glyph with zero contours (e.g. space). The caller
+    /// owns the returned slice; `error.OutOfMemory` propagates and never
+    /// returns a partial list.
+    pub fn outlineCommands(
+        self: *Face,
+        alloc: std.mem.Allocator,
+        glyph: u32,
+        font_size: f32,
+        fake_italic: bool,
+    ) Error!?[]swash_cache_mod.OutlineCommand {
+        try self.setCharSize(font_size);
+        const no_bitmap: c_int = @intCast(c.FT_LOAD_NO_BITMAP);
+        const load_flags: c_int = FT_LOAD_DEFAULT | FT_LOAD_NO_HINTING | no_bitmap;
+        const code = c.FT_Load_Glyph(self.handle.handle, glyph, load_flags);
+        if (code != c.FT_Err_Ok) return null; // no outline to give (upstream None)
+        const slot = self.handle.handle.*.glyph;
+        if (slot == null) return null;
+        // Embedded bitmap strikes and color-only glyphs have no vector data
+        // (upstream additionally probes swash's color-outline source; that
+        // COLR path is not decomposed here yet — documented divergence).
+        if (slot.*.format == FT_GLYPH_FORMAT_BITMAP) return null;
+        var list: std.ArrayList(swash_cache_mod.OutlineCommand) = .empty;
+        errdefer list.deinit(alloc);
+        var ctx = DecomposeCtx{ .list = &list, .alloc = alloc, .fake_italic = fake_italic };
+        const funcs = c.FT_Outline_Funcs{
+            .move_to = decomposeMoveTo,
+            .line_to = decomposeLineTo,
+            .conic_to = decomposeConicTo,
+            .cubic_to = decomposeCubicTo,
+        };
+        const dec = c.FT_Outline_Decompose(&slot.*.outline, &funcs, &ctx);
+        if (ctx.oom) return error.OutOfMemory;
+        if (dec != c.FT_Err_Ok) return null; // errdefer frees the partial list
+        return try list.toOwnedSlice(alloc);
+    }
+
     /// `FT_Get_Kerning` with `FT_KERNING_DEFAULT`.
     ///
     /// Returns the x kerning in 26.6 fixed point (64 = 1 pixel); FreeType
@@ -588,6 +640,55 @@ fn pixelsTo26_6(v: f32) c_long {
 /// `FAKE_ITALIC` (swash.rs:70-77: `Transform::skew(14deg, 0deg)`).
 const FAKE_ITALIC_TAN: f64 = 0.24932800284318068;
 const FAKE_ITALIC_MATRIX_XY: c_long = @intFromFloat(FAKE_ITALIC_TAN * 65536.0);
+
+/// User state for `FT_Outline_Decompose` (see `Face.outlineCommands`).
+/// FreeType reports points in26.6 fixed point; this converts to pixel-space
+/// y-up coordinates (swash `scale_outline` convention) and applies the same
+///14° FAKE_ITALIC skew the raster path uses.
+const DecomposeCtx = struct {
+    list: *std.ArrayList(swash_cache_mod.OutlineCommand),
+    alloc: std.mem.Allocator,
+    fake_italic: bool,
+    /// Set instead of propagating through the C ABI: a callback can only
+    /// abort with a nonzero code, which `outlineCommands` maps back to OOM.
+    oom: bool = false,
+
+    fn point(self: *DecomposeCtx, v: [*c]const c.FT_Vector) swash_cache_mod.Point {
+        const y: f32 = @as(f32, @floatFromInt(v.*.y)) / 64.0;
+        var x: f32 = @as(f32, @floatFromInt(v.*.x)) / 64.0;
+        if (self.fake_italic) x += swash_cache_mod.fakeItalicSkewDx(y);
+        return .{ .x = x, .y = y };
+    }
+
+    /// Returns0 on success, nonzero to abort the decomposition (OOM only).
+    fn push(self: *DecomposeCtx, cmd: swash_cache_mod.OutlineCommand) c_int {
+        self.list.append(self.alloc, cmd) catch {
+            self.oom = true;
+            return 1;
+        };
+        return 0;
+    }
+};
+
+fn decomposeMoveTo(to: [*c]const c.FT_Vector, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *DecomposeCtx = @ptrCast(@alignCast(user.?));
+    return ctx.push(.{ .move_to = ctx.point(to) });
+}
+
+fn decomposeLineTo(to: [*c]const c.FT_Vector, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *DecomposeCtx = @ptrCast(@alignCast(user.?));
+    return ctx.push(.{ .line_to = ctx.point(to) });
+}
+
+fn decomposeConicTo(control: [*c]const c.FT_Vector, to: [*c]const c.FT_Vector, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *DecomposeCtx = @ptrCast(@alignCast(user.?));
+    return ctx.push(.{ .quad_to = .{ .control = ctx.point(control), .to = ctx.point(to) } });
+}
+
+fn decomposeCubicTo(c1: [*c]const c.FT_Vector, c2: [*c]const c.FT_Vector, to: [*c]const c.FT_Vector, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *DecomposeCtx = @ptrCast(@alignCast(user.?));
+    return ctx.push(.{ .curve_to = .{ .c1 = ctx.point(c1), .c2 = ctx.point(c2), .to = ctx.point(to) } });
+}
 
 /// A rendered glyph bitmap. `bitmap` borrows the face's glyph slot (see the
 /// module docs): it is valid until the next `Face.loadRender*` call or
