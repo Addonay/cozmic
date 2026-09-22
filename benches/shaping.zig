@@ -57,6 +57,10 @@ const default_warmup: usize = 5;
 const quick_iters: usize = 3;
 const quick_warmup: usize = 1;
 
+/// See benches/layout.zig `CacheMode`: `.off` = upstream-parity (cache
+/// disabled), `.warm` = steady-state hits after the warmup fill.
+const CacheMode = enum { off, warm };
+
 fn truthy(value: []const u8) bool {
     return value.len != 0 and
         !std.mem.eql(u8, value, "0") and
@@ -105,6 +109,7 @@ fn timeCold(
     iters: usize,
     warmup: usize,
     io: std.Io,
+    cache: CacheMode,
 ) !struct { mean_ns: f64, median_ns: f64, glyphs: usize } {
     var attrs = cozmic.attrs.Attrs.init(arena);
     defer attrs.deinit();
@@ -115,6 +120,15 @@ fn timeCold(
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
     var glyphs: usize = 0;
+    switch (cache) {
+        .off => fsys.setRunCacheEnabled(false),
+        .warm => {
+            fsys.setRunCacheEnabled(true);
+            // Cold start here; the warmup loop below fills the cache, so the
+            // timed iterations measure steady-state hits only.
+            fsys.clearRunCache();
+        },
+    }
     var k: usize = 0;
     while (k < warmup) : (k += 1) {
         _ = scratch_state.reset(.{ .retain_with_limit = 64 << 20 });
@@ -190,11 +204,20 @@ pub fn main(init: std.process.Init) !void {
 
     if (!opts.json) try w.print("cozmic bench-shaping: {d} cases (iters={d} warmup={d}{s})\n", .{ cases.len, opts.iters, opts.warmup, if (opts.quick) " quick" else "" });
     for (cases) |c| {
-        const r = try timeCold(arena, &fsys, c.text, 500, opts.iters, opts.warmup, io);
+        const r = try timeCold(arena, &fsys, c.text, 500, opts.iters, opts.warmup, io, .off);
         if (opts.json) {
             try w.print("{{\"bench\":\"shaping/{s}\",\"iters\":{d},\"mean_ns\":{d:.1},\"median_ns\":{d:.1},\"glyphs\":{d}}}\n", .{ c.name, opts.iters, r.mean_ns, r.median_ns, r.glyphs });
         } else {
             try w.print("  {s} cold glyphs={d} mean={d:.0}ns median={d:.0}ns\n", .{ c.name, r.glyphs, r.mean_ns, r.median_ns });
+        }
+        // Warm run-cache showcase (see benches/layout.zig): the warmup loop
+        // fills the cache, timed iterations measure steady-state hits. The
+        // suffix keeps the row in bench_compare's COZMIC-ONLY section.
+        const rw = try timeCold(arena, &fsys, c.text, 500, opts.iters, opts.warmup, io, .warm);
+        if (opts.json) {
+            try w.print("{{\"bench\":\"shaping/{s} (run-cache warm)\",\"iters\":{d},\"mean_ns\":{d:.1},\"median_ns\":{d:.1},\"glyphs\":{d}}}\n", .{ c.name, opts.iters, rw.mean_ns, rw.median_ns, rw.glyphs });
+        } else {
+            try w.print("  {s} warm glyphs={d} mean={d:.0}ns median={d:.0}ns (run-cache warm; zig-only, no rust row)\n", .{ c.name, rw.glyphs, rw.mean_ns, rw.median_ns });
         }
     }
     // BidiParagraphs counting (no FontSystem, mirrors Rust BidiParagraphs benches).

@@ -277,6 +277,17 @@ pub const Backend = struct {
     /// Bounded fallback-selection memo (see module header). Empty (and never
     /// consulted) without a resolver.
     fallback_memo: FallbackMemoMap = .empty,
+    /// Persistent advanced-path shaped-run cache (shape.rs run cache; the
+    /// adapter seam hands this out via `VTable.run_cache`). Lives on the
+    /// backend so it survives Buffer/BufferLine churn — matches upstream,
+    /// which stores its cache on `FontSystem`.
+    run_cache: shape_mod.ShapeRunCache,
+    /// When false, `runCacheFn` reports no cache and the advanced path runs
+    /// uncached. Bench parity rows use this: upstream's equivalent
+    /// `shape-run-cache` feature is default-off, so standard bench rows must
+    /// not charge us lookups/inserts upstream never pays. Library consumers
+    /// keep the default (`true`).
+    run_cache_enabled: bool = true,
     /// Transient per-fallback-resolution flags, reset when `fallback_for` is
     /// asked for attempt 0 and consumed when the scan exhausts. Kept on the
     /// backend so `note_fallback` and `fallback_for` share them (shaping is
@@ -309,10 +320,15 @@ pub const Backend = struct {
         // backend.
         try hb.dyn.ensureLoaded();
         const buffer = hb.Buffer.create() catch return error.OutOfMemory;
-        return .{ .allocator = allocator, .buffer = buffer };
+        return .{
+            .allocator = allocator,
+            .buffer = buffer,
+            .run_cache = shape_mod.ShapeRunCache.init(allocator),
+        };
     }
 
     pub fn deinit(self: *Backend) void {
+        self.run_cache.deinit();
         self.clearFallbackMemo();
         self.fallback_memo.deinit(self.allocator);
         for (self.entries.items) |*e| self.destroyEntry(e);
@@ -842,7 +858,14 @@ const vtable: shape_mod.ShapeAdapter.VTable = .{
     .fallback_font = fallbackFontFn,
     .probe_pair = probePairFn,
     .note_fallback = noteFallbackFn,
+    .run_cache = runCacheFn,
 };
+
+fn runCacheFn(ptr: *anyopaque) ?*shape_mod.ShapeRunCache {
+    const self: *Backend = @ptrCast(@alignCast(ptr));
+    if (!self.run_cache_enabled) return null;
+    return &self.run_cache;
+}
 
 /// Apply `weight` as the OpenType `wght` variation coordinate on `entry`'s
 /// HarfBuzz font. Non-variable fonts ignore variation coordinates.

@@ -41,6 +41,12 @@ const default_warmup: usize = 5;
 const quick_iters: usize = 3;
 const quick_warmup: usize = 1;
 
+/// Which shaped-run-cache semantics a timed row measures. `.off` matches
+/// upstream's default features (cache disabled); `.warm` keeps the cache on,
+/// lets the warmup loop fill it, and times steady-state hits — what editors
+/// and frame loops pay after the first render.
+const CacheMode = enum { off, warm };
+
 fn truthy(value: []const u8) bool {
     return value.len != 0 and
         !std.mem.eql(u8, value, "0") and
@@ -91,6 +97,7 @@ fn timeIt(
     iters: usize,
     warmup: usize,
     io: std.Io,
+    cache: CacheMode,
 ) !struct { mean_ns: f64, median_ns: f64, glyphs: usize, runs: usize } {
     var attrs = cozmic.attrs.Attrs.init(arena);
     defer attrs.deinit();
@@ -104,6 +111,15 @@ fn timeIt(
     const scratch = scratch_state.allocator();
     var glyphs: usize = 0;
     var runs: usize = 0;
+    switch (cache) {
+        .off => fsys.setRunCacheEnabled(false),
+        .warm => {
+            fsys.setRunCacheEnabled(true);
+            // Cold start here; the warmup loop below fills the cache, so the
+            // timed iterations measure steady-state hits only.
+            fsys.clearRunCache();
+        },
+    }
     // Warmup (discard).
     var k: usize = 0;
     while (k < warmup) : (k += 1) {
@@ -240,7 +256,7 @@ pub fn main(init: std.process.Init) !void {
     for (samples) |s| {
         for (wraps) |wrap| {
             for (shapings) |shape| {
-                const r = try timeIt(arena, &fsys, s.text, wrap, shape.mode, 80, opts.iters, opts.warmup, io);
+                const r = try timeIt(arena, &fsys, s.text, wrap, shape.mode, 80, opts.iters, opts.warmup, io, .off);
                 const extra = if (wrap == .word_or_glyph) " (zig-only, no rust row)" else "";
                 if (opts.json) {
                     try w.print("{{\"bench\":\"layout/{s}/Wrap({s}, {s})\",\"iters\":{d},\"mean_ns\":{d:.1},\"median_ns\":{d:.1},\"glyphs\":{d},\"runs\":{d}}}\n", .{ s.name, @tagName(wrap), shape.name, opts.iters, r.mean_ns, r.median_ns, r.glyphs, r.runs });
@@ -248,6 +264,22 @@ pub fn main(init: std.process.Init) !void {
                     try w.print("  {s} wrap={s} shape={s} width=80 runs={d} glyphs={d} mean={d:.0}ns median={d:.0}ns{s}\n", .{
                         s.name, @tagName(wrap), shape.name, r.runs, r.glyphs, r.mean_ns, r.median_ns, extra,
                     });
+                }
+                // Warm run-cache showcase: advanced rows on the non-emoji
+                // samples (emoji's cold pass costs minutes and the other rows
+                // already demonstrate the effect). The suffix keeps these rows
+                // in bench_compare's COZMIC-ONLY section — upstream's
+                // `shape-run-cache` feature is default-off, so a matched row
+                // would not be an apples-to-apples comparison anyway.
+                if (shape.mode == .advanced and !std.mem.eql(u8, s.name, "emoji")) {
+                    const rw = try timeIt(arena, &fsys, s.text, wrap, shape.mode, 80, opts.iters, opts.warmup, io, .warm);
+                    if (opts.json) {
+                        try w.print("{{\"bench\":\"layout/{s}/Wrap({s}, {s}, run-cache warm)\",\"iters\":{d},\"mean_ns\":{d:.1},\"median_ns\":{d:.1},\"glyphs\":{d},\"runs\":{d}}}\n", .{ s.name, @tagName(wrap), shape.name, opts.iters, rw.mean_ns, rw.median_ns, rw.glyphs, rw.runs });
+                    } else {
+                        try w.print("  {s} wrap={s} shape={s} width=80 runs={d} glyphs={d} mean={d:.0}ns median={d:.0}ns (run-cache warm; zig-only, no rust row)\n", .{
+                            s.name, @tagName(wrap), shape.name, rw.runs, rw.glyphs, rw.mean_ns, rw.median_ns,
+                        });
+                    }
                 }
             }
         }

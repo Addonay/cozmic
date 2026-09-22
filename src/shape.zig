@@ -221,7 +221,7 @@ pub const Shaping = enum {
     ) ShapeError!void {
         switch (self) {
             .basic => try shapeSkip(alloc, adapter, out, line, attrs, start_run, end_run),
-            .advanced => try shapeRun(alloc, adapter, buf, out, line, attrs, start_run, end_run, span_rtl),
+            .advanced => try shapeRunCached(alloc, adapter, buf, out, line, attrs, start_run, end_run, span_rtl),
         }
     }
 };
@@ -440,6 +440,11 @@ pub fn fontQueryFor(a: *const attrs_mod.AttrsOwned) FontQuery {
 /// HarfBuzz backend; `shapeFallback`/`shapeRun` below already implement the
 /// exact surrounding logic (plan-cache FIFO, tab rewrite, missing collection,
 /// end adjustment, fallback splice).
+/// Re-export: the age-stamped shaped-run cache consulted by the advanced
+/// path through the adapter seam (`ShapeAdapter.runCache`).
+pub const ShapeRunCache = @import("shape_run_cache.zig").ShapeRunCache;
+const run_cache_mod = @import("shape_run_cache.zig");
+
 pub const ShapeAdapter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -477,6 +482,12 @@ pub const ShapeAdapter = struct {
         fallback_font: *const fn (ptr: *anyopaque, script: Script, attempt: usize) ?FontId,
         /// Shape the two-char probe text for the punct-ligature check.
         probe_pair: *const fn (ptr: *anyopaque, font: FontId, c1: u21, c2: u21) ProbeResult,
+        /// Age-stamped shaped-run cache for the advanced path. `null` (the
+        /// default) disables caching for this adapter — mirroring
+        /// cosmic-text's default-off `shape-run-cache` feature — so test
+        /// doubles keep counting every shape call; the real HarfBuzz backend
+        /// returns its persistent cache (see `shapeRunCached`).
+        run_cache: ?*const fn (ptr: *anyopaque) ?*ShapeRunCache = null,
         /// Optional: outcome of one fallback attempt in `shapeRun` (a no-op
         /// when unset, which is the default so charmap/test adapters need no
         /// changes). `font` was shaped for the run and `covered` is true when
@@ -534,6 +545,13 @@ pub const ShapeAdapter = struct {
     pub fn noteFallback(self: ShapeAdapter, query: FontQuery, script: Script, font: FontId, covered: bool) void {
         if (self.vtable.note_fallback) |hook| hook(self.ptr, query, script, font, covered);
     }
+    /// The advanced path's shaped-run cache, or `null` when this adapter
+    /// disables caching (the default for test doubles; upstream's feature is
+    /// default-off too).
+    pub fn runCache(self: ShapeAdapter) ?*ShapeRunCache {
+        const hook = self.vtable.run_cache orelse return null;
+        return hook(self.ptr);
+    }
 };
 
 pub const PRIMARY_FONT_ID: FontId = 1;
@@ -557,6 +575,9 @@ pub const CharmapAdapter = struct {
     /// Punct pairs that shape as a ligature (probe returns `count = 1`).
     ligature_probe_count: usize = 2,
     runs_shaped: usize = 0,
+    /// Optional shaped-run cache for wiring tests (`null` = disabled, the
+    /// default; the real cache lives on `shape_hb.Backend`).
+    test_run_cache: ?*ShapeRunCache = null,
 
     pub fn adapter(self: *CharmapAdapter) ShapeAdapter {
         return .{ .ptr = self, .vtable = &.{
@@ -571,7 +592,13 @@ pub const CharmapAdapter = struct {
             .fallback_for = charmapFallbackFor,
             .fallback_font = fallbackFont,
             .probe_pair = probePair,
+            .run_cache = charmapRunCache,
         } };
+    }
+
+    fn charmapRunCache(ptr: *anyopaque) ?*ShapeRunCache {
+        const self: *CharmapAdapter = @ptrCast(@alignCast(ptr));
+        return self.test_run_cache;
     }
 
     /// The charmap stand-in has no database; named queries keep the old
@@ -1063,6 +1090,8 @@ pub fn shapeSkipAppend(
     // before any `mapGlyph`/`advanceEm`/`fontMetrics` query.
     adapter.setWeight(attrs.get_span(start_run).weight.value);
     const fm = adapter.fontMetrics(font);
+    // One glyph max per source byte: reserve up front to skip growth copies.
+    try out.ensureTotalCapacity(alloc, out.items.len + (end_run - start_run));
     var i = start_run;
     while (i < end_run) {
         const d = decodeOne(line, i);
@@ -1105,6 +1134,106 @@ pub fn shapeSkipGlyphs(
     errdefer glyphs.deinit(alloc);
     try shapeSkipAppend(alloc, adapter, &glyphs, font, line, attrs, start_run, end_run);
     return glyphs.toOwnedSlice(alloc);
+}
+
+/// Bounds for the advanced-path run cache. Entries hold owned run text,
+/// cloned attrs and a glyph vector, so the cap must comfortably fit a real
+/// document's unique word-runs — hello/moby carry2-8k of them. Past the cap
+/// the cache trims to the most recently used half (entries are age-stamped by
+/// both `get` and `insert`, so hot runs refresh and survive); upstream's
+/// ShapeRunCache is unbounded, this keeps worst-case memory in check without
+/// evicting a working set. ~16k entries ≈ single-digit MB worst case.
+const run_cache_max: usize = 16384;
+
+/// Advanced-path shaped-run cache (upstream `shape_run_cached`, behind the
+/// default-off `shape-run-cache` feature; always available here, opt-in per
+/// adapter via `VTable.run_cache`). Identical `(run text, default attrs,
+/// non-default spans)` runs shape once per cache lifetime; stored glyphs keep
+/// run-relative byte offsets and are rebased to the caller's absolute range on
+/// every use, so a hit is indistinguishable from fresh shaping (the image and
+/// wrap suites enforce that equality).
+pub fn shapeRunCached(
+    alloc: std.mem.Allocator,
+    adapter: ShapeAdapter,
+    buf: *ShapeBuffer,
+    out: *std.ArrayList(ShapeGlyph),
+    line: []const u8,
+    attrs: *const AttrsList,
+    start_run: usize,
+    end_run: usize,
+    span_rtl: bool,
+) ShapeError!void {
+    const cache = adapter.runCache() orelse {
+        return shapeRun(alloc, adapter, buf, out, line, attrs, start_run, end_run, span_rtl);
+    };
+
+    // Borrowed lookup key: the run text plus every non-default attrs span
+    // overlapping it, with run-relative ranges (mirrors `ShapeRunKey`).
+    const AttrSpanT = run_cache_mod.AttrSpan;
+    const items = attrs.spans.items;
+    var wi: usize = 0;
+    while (wi < items.len and items[wi].end <= start_run) wi += 1;
+    var wj: usize = wi;
+    while (wj < items.len and items[wj].start < end_run) wj += 1;
+    const empty: [0]AttrSpanT = .{};
+    var stack_storage: [8]AttrSpanT = undefined;
+    var heap_storage: ?[]AttrSpanT = null;
+    defer if (heap_storage) |hs| alloc.free(hs);
+    var spans: []const AttrSpanT = &empty;
+    {
+        var count: usize = 0;
+        for (items[wi..wj]) |*s| {
+            if (s.attrs.eql(&attrs.default_attrs)) continue;
+            const lo = @max(s.start, start_run);
+            if (@min(s.end, end_run) > lo) count += 1;
+        }
+        if (count > 0) {
+            const dst: []AttrSpanT = if (count <= stack_storage.len)
+                stack_storage[0..count]
+            else blk: {
+                heap_storage = try alloc.alloc(AttrSpanT, count);
+                break :blk heap_storage.?;
+            };
+            var n: usize = 0;
+            for (items[wi..wj]) |*s| {
+                if (s.attrs.eql(&attrs.default_attrs)) continue;
+                const lo = @max(s.start, start_run);
+                const hi = @min(s.end, end_run);
+                if (hi <= lo) continue;
+                dst[n] = .{ .start = lo - start_run, .end = hi - start_run, .attrs = &s.attrs };
+                n += 1;
+            }
+            spans = dst[0..n];
+        }
+    }
+    const key = run_cache_mod.KeyRef{
+        .text = line[start_run..end_run],
+        .default_attrs = &attrs.default_attrs,
+        .spans = spans,
+    };
+
+    if (cache.get(&key)) |glyphs| {
+        // Stored offsets are run-relative; rebase to this call's range. No
+        // capacity dance here: the caller's list is already reserved
+        // (buildWord sizes per word) and plain append keeps growth doubling
+        // instead of forcing an exact-size realloc per cached run.
+        for (glyphs) |g| {
+            var abs = g;
+            abs.start += start_run;
+            abs.end += start_run;
+            try out.append(alloc, abs);
+        }
+        return;
+    }
+
+    var shaped: std.ArrayList(ShapeGlyph) = .empty;
+    defer shaped.deinit(alloc);
+    try shapeRun(alloc, adapter, buf, &shaped, line, attrs, start_run, end_run, span_rtl);
+    // Output gets the absolute copy; the cache keeps run-relative offsets.
+    try out.appendSlice(alloc, shaped.items);
+    try rebaseGlyphs(shaped.items, -@as(isize, @intCast(start_run)));
+    try cache.insert(&key, shaped.items);
+    if (cache.len() >= run_cache_max) cache.trim(run_cache_max / 2);
 }
 
 /// Basic shaping without fallback, plus the SansSerif/Monospace repatch for
@@ -1386,6 +1515,9 @@ pub fn buildWord(
     const span_rtl = levelIsRtl(level);
     var glyphs: std.ArrayList(ShapeGlyph) = .empty;
     errdefer glyphs.deinit(alloc);
+    // Worst case is one glyph per source byte; reserving up front removes the
+    // ArrayList growth doubling (and its copies) from the per-word hot path.
+    try glyphs.ensureTotalCapacity(alloc, word_end - word_start);
 
     if (isSimpleAsciiWord(line, word_start, word_end, attrs)) {
         try shaping.run(alloc, adapter, buf, &glyphs, line, attrs, word_start, word_end, span_rtl);
@@ -3436,6 +3568,64 @@ test "overrideFakeItalic sets the flag only for synthetic italics" {
     try std.testing.expect(none.eql(overrideFakeItalic(none, false, .normal)));
     const merged = overrideFakeItalic(some, false, .italic);
     try std.testing.expectEqual(@as(u32, 0b110 | 1), merged.bits);
+}
+
+test "advanced run cache hits skip shaping and rebase offsets (shape.rs run cache)" {
+    const t = std.testing;
+    var backend = CharmapAdapter{};
+    var cache = ShapeRunCache.init(t.allocator);
+    defer cache.deinit();
+    backend.test_run_cache = &cache;
+    const adapter = backend.adapter();
+    var attrs_list = try testAttrsList(t.allocator);
+    defer attrs_list.deinit();
+    var buf = ShapeBuffer.init();
+    defer buf.deinit(t.allocator);
+    const line = "abc def";
+
+    // First run: shapes, stores run-relative glyphs.
+    var out1: std.ArrayList(ShapeGlyph) = .empty;
+    defer out1.deinit(t.allocator);
+    try Shaping.advanced.run(t.allocator, adapter, &buf, &out1, line, &attrs_list, 0, line.len, false);
+    try t.expect(backend.runs_shaped > 0);
+    try t.expectEqual(@as(usize, 1), cache.len());
+    try t.expect(out1.items.len > 0);
+
+    // Second identical run: cache hit — no new shape, identical glyphs.
+    var out2: std.ArrayList(ShapeGlyph) = .empty;
+    defer out2.deinit(t.allocator);
+    const shaped_before = backend.runs_shaped;
+    try Shaping.advanced.run(t.allocator, adapter, &buf, &out2, line, &attrs_list, 0, line.len, false);
+    try t.expectEqual(shaped_before, backend.runs_shaped);
+    try t.expectEqual(out1.items.len, out2.items.len);
+    for (out1.items, out2.items) |a, b| {
+        try t.expectEqual(a.start, b.start);
+        try t.expectEqual(a.end, b.end);
+        try t.expectEqual(a.glyph_id, b.glyph_id);
+        try t.expectEqual(a.x_advance, b.x_advance);
+    }
+
+    // Same run text at a different absolute offset: hit rebases +offset.
+    const shifted_line = "Xabc def";
+    var out3: std.ArrayList(ShapeGlyph) = .empty;
+    defer out3.deinit(t.allocator);
+    try Shaping.advanced.run(t.allocator, adapter, &buf, &out3, shifted_line, &attrs_list, 1, shifted_line.len, false);
+    try t.expectEqual(shaped_before, backend.runs_shaped);
+    try t.expectEqual(out1.items.len, out3.items.len);
+    for (out1.items, out3.items) |a, b| {
+        try t.expectEqual(a.start + 1, b.start);
+        try t.expectEqual(a.end + 1, b.end);
+        try t.expectEqual(a.glyph_id, b.glyph_id);
+    }
+
+    // Cleared cache: the next identical run shapes again.
+    cache.clear();
+    try t.expectEqual(@as(usize, 0), cache.len());
+    var out4: std.ArrayList(ShapeGlyph) = .empty;
+    defer out4.deinit(t.allocator);
+    try Shaping.advanced.run(t.allocator, adapter, &buf, &out4, line, &attrs_list, 0, line.len, false);
+    try t.expect(backend.runs_shaped > shaped_before);
+    try t.expectEqual(@as(usize, 1), cache.len());
 }
 
 test "shapeSkipBasic repatches missing glyphs via Sans/Mono" {

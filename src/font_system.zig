@@ -1127,6 +1127,21 @@ pub const FontSystem = struct {
         return null;
     }
 
+    /// Drop every shaped-run cache entry (cold start). The cache otherwise
+    /// persists with this `FontSystem` across buffers and frames; benches use
+    /// this together with `setRunCacheEnabled` to time either cold or warm
+    /// semantics (upstream's equivalent feature is default-off).
+    pub fn clearRunCache(self: *FontSystem) void {
+        if (self.shaper_backend) |*b| b.run_cache.clear();
+    }
+
+    /// Enable/disable the backend's shaped-run cache without destroying it.
+    /// Parity bench rows disable it (upstream default-off); warm rows enable
+    /// it. Library consumers never call this — the default is enabled.
+    pub fn setRunCacheEnabled(self: *FontSystem, on: bool) void {
+        if (self.shaper_backend) |*b| b.run_cache_enabled = on;
+    }
+
     /// Bytes of a registered font, by `FontId` (borrowed from the backend).
     /// Returns the owned copy for eager registrations and the loaded blob for
     /// lazily registered fonts; `null` before a lazy font loads. Used by the

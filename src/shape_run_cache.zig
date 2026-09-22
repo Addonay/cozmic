@@ -6,28 +6,26 @@
 //! (shape_run_cache.rs:9-13). The backing store is a linear entry list (run
 //! caches are tiny; lookup cost is negligible next to shaping).
 //!
-//! `CachedGlyph` remains the minimal shaped-glyph stand-in here (byte range +
-//! shaped output). TODO(cache): replace it with `shape.ShapeGlyph` when the
-//! buffer layer wires the real shaper into this cache; cross-file imports are
-//! allowed now, the dependency is simply not needed for the age/eviction
-//! behavior this module owns.
+//! `CachedGlyph` is the full `shape.ShapeGlyph`: the advanced path is now
+//! wired through this cache (shape.zig `shapeRunCached`), so a hit must
+//! reproduce every field — a minimal stand-in would drop color, metrics,
+//! weight and font state. This creates a mutual import with `shape.zig`
+//! (which needs this module for the adapter seam); Zig resolves it because
+//! neither type depends on the other at comptime.
 //!
 //! Verbatim semantics preserved from `ShapeRunCache`:
 //! - `get` stamps the entry with the current age and returns it (`None` miss).
 //! - `insert` stamps the entry with the current age (overwrites on key clash).
 //! - `trim(keep)` retains entries with `age + keep >= now`, then bumps `now`.
+//! - `clear` drops everything while keeping the backing allocation (used by
+//!   cold-cache measurements and corpus resets; upstream has no equivalent).
 
 const std = @import("std");
 const attrs = @import("attrs.zig");
 
-/// Minimal shaped glyph the cache preserves across hits (byte range + shaped
-/// output). See the module TODO about `shape.ShapeGlyph`.
-pub const CachedGlyph = struct {
-    start: usize,
-    end: usize,
-    glyph_id: u16,
-    x_advance: f32,
-};
+/// Full shaped glyph stored across hits (port decision: store the real
+/// `shape.ShapeGlyph`, mirroring upstream's `Vec<ShapeGlyph>` cache values).
+pub const CachedGlyph = @import("shape.zig").ShapeGlyph;
 
 /// Borrowed non-default attrs span: run-relative range plus borrowed attrs.
 /// Mirrors `(Range<usize>, &AttrsOwned)` in `ShapeRunKey` (shape_run_cache.rs:12).
@@ -103,11 +101,19 @@ pub const ShapeRunCache = struct {
     }
 
     pub fn deinit(self: *ShapeRunCache) void {
+        self.clear();
+        self.entries.deinit(self.allocator);
+    }
+
+    /// Drop every entry while keeping the backing allocation. Cold-cache
+    /// measurements (the benches) and corpus resets use this; production
+    /// callers normally rely on `trim` for bounded eviction.
+    pub fn clear(self: *ShapeRunCache) void {
         for (self.entries.items) |*e| {
             e.key.deinit(self.allocator);
             self.allocator.free(e.glyphs);
         }
-        self.entries.deinit(self.allocator);
+        self.entries.clearRetainingCapacity();
     }
 
     pub fn len(self: *const ShapeRunCache) usize {
@@ -218,8 +224,24 @@ const TestKey = struct {
 };
 
 fn testGlyphs() [1]CachedGlyph {
-    return [_]CachedGlyph{
-        .{ .start = 0, .end = 5, .glyph_id = 42, .x_advance = 0.6 },
+    return [_]CachedGlyph{testGlyph(0, 5, 42, 0.6)};
+}
+
+/// Test glyph literal helper: fills the full `ShapeGlyph` fields the cache
+/// now stores, with the identity fields under test supplied explicitly.
+fn testGlyph(start: usize, end: usize, glyph_id: u16, x_advance: f32) CachedGlyph {
+    return .{
+        .start = start,
+        .end = end,
+        .x_advance = x_advance,
+        .y_advance = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+        .ascent = 0,
+        .descent = 0,
+        .font_id = 0,
+        .font_weight = attrs.Weight.normal,
+        .glyph_id = glyph_id,
     };
 }
 
@@ -253,11 +275,8 @@ test "insert overwrites existing key" {
     defer c.deinit();
     var tk = try TestKey.init();
     defer tk.deinit();
-    const g1 = [_]CachedGlyph{.{ .start = 0, .end = 1, .glyph_id = 1, .x_advance = 0.5 }};
-    const g2 = [_]CachedGlyph{
-        .{ .start = 0, .end = 1, .glyph_id = 2, .x_advance = 0.5 },
-        .{ .start = 1, .end = 2, .glyph_id = 3, .x_advance = 0.5 },
-    };
+    const g1 = [_]CachedGlyph{testGlyph(0, 1, 1, 0.5)};
+    const g2 = [_]CachedGlyph{ testGlyph(0, 1, 2, 0.5), testGlyph(1, 2, 3, 0.5) };
     try c.insert(&tk.ref("ab", &.{}), &g1);
     try c.insert(&tk.ref("ab", &.{}), &g2);
     try std.testing.expectEqual(@as(usize, 1), c.len());
@@ -271,7 +290,7 @@ test "trim retains age+keep>=now then bumps clock" {
     defer c.deinit();
     var tk = try TestKey.init();
     defer tk.deinit();
-    const g = [_]CachedGlyph{.{ .start = 0, .end = 1, .glyph_id = 9, .x_advance = 1.0 }};
+    const g = [_]CachedGlyph{testGlyph(0, 1, 9, 1.0)};
     try c.insert(&tk.ref("a", &.{}), &g); // stamped age 0, now 0
     c.trim(0); // 0+0>=0 retain; now -> 1
     try std.testing.expectEqual(@as(usize, 1), c.len());
@@ -286,7 +305,7 @@ test "get refreshes entry so trim keeps it" {
     defer c.deinit();
     var tk = try TestKey.init();
     defer tk.deinit();
-    const g = [_]CachedGlyph{.{ .start = 0, .end = 1, .glyph_id = 9, .x_advance = 1.0 }};
+    const g = [_]CachedGlyph{testGlyph(0, 1, 9, 1.0)};
     try c.insert(&tk.ref("a", &.{}), &g); // age 0
     c.trim(5); // retain; now -> 1
     _ = c.get(&tk.ref("a", &.{})); // bump entry to age 1
@@ -315,7 +334,7 @@ test "keys distinguish default attrs, spans, and compare by content" {
     defer owned_span.deinit();
     const spans = [_]AttrSpan{.{ .start = 0, .end = 1, .attrs = &owned_span }};
 
-    const g = [_]CachedGlyph{.{ .start = 0, .end = 1, .glyph_id = 1, .x_advance = 1.0 }};
+    const g = [_]CachedGlyph{testGlyph(0, 1, 1, 1.0)};
     try c.insert(&tk.ref("a", &.{}), &g);
     try std.testing.expect(c.get(&tk_bold.ref("a", &.{})) == null);
     try std.testing.expect(c.get(&tk.ref("a", &spans)) == null);
