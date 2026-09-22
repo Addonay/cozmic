@@ -139,6 +139,14 @@ pub const FontEntry = struct {
     strikethrough: ?shape_mod.DecoSpec = null,
     /// Ascent in design units, for `decorationMetrics`.
     ascent_units: f32 = 0,
+    /// Weight currently applied to `font` through `hb_font_set_variations`,
+    /// or null when no variation coordinate has been applied yet. That call
+    /// marks the font dirty (variation normalization plus glyph/metrics cache
+    /// invalidation) every time, so the per-character cmap/advance queries and
+    /// per-run shaping must only pay it when the requested weight actually
+    /// differs from the applied one. Static faces benefit identically: their
+    /// coordinates never change after the first application.
+    applied_weight: ?u16 = null,
 };
 
 /// Fontconfig/FreeType pack named-instance bits into the high half of
@@ -550,6 +558,8 @@ pub const Backend = struct {
 
         entry.face = face;
         entry.font = font;
+        // Fresh hb_font_t: no wght coordinate applied yet.
+        entry.applied_weight = null;
         entry.upem = upem;
         entry.ascent = ascent;
         entry.descent = descent;
@@ -840,11 +850,17 @@ fn applyWeight(entry: *FontEntry, weight: u16) void {
     // Callers run `ensureLoaded` first; guard anyway so an unloaded entry can
     // never dereference a null font.
     const font = entry.font orelse return;
+    // Set-on-change only: hb_font_set_variations invalidates the font's
+    // normalized-coordinate and glyph caches on every call, so re-setting an
+    // already-applied weight on each cmap/advance query or shape run would
+    // destroy exactly the caches the next call wants to reuse.
+    if (entry.applied_weight == weight) return;
     var variation = hb.c.hb_variation_t{
         .tag = hb.c.HB_TAG('w', 'g', 'h', 't'),
         .value = @floatFromInt(weight),
     };
     hb.c.hb_font_set_variations(font.handle, &variation, 1);
+    entry.applied_weight = weight;
 }
 
 fn setWeightFn(ptr: *anyopaque, weight: u16) void {

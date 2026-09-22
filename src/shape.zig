@@ -1047,28 +1047,28 @@ pub fn rebaseGlyphs(glyphs: []ShapeGlyph, delta: isize) ShapeError!void {
 // Basic path: shape_skip (shape.rs:500-638)
 // ---------------------------------------------------------------------------
 
-/// Per-character charmap shaping (shape.rs:587-638).
-pub fn shapeSkipGlyphs(
+/// Per-character charmap shaping (shape.rs:587-638), appending directly into
+/// `out` so the basic path never allocates a temporary slice per word.
+pub fn shapeSkipAppend(
     alloc: std.mem.Allocator,
     adapter: ShapeAdapter,
+    out: *std.ArrayList(ShapeGlyph),
     font: FontId,
     line: []const u8,
     attrs: *const AttrsList,
     start_run: usize,
     end_run: usize,
-) ShapeError![]ShapeGlyph {
+) ShapeError!void {
     // Basic shaping still needs the run's weight (variable fonts); set it
     // before any `mapGlyph`/`advanceEm`/`fontMetrics` query.
     adapter.setWeight(attrs.get_span(start_run).weight.value);
     const fm = adapter.fontMetrics(font);
-    var glyphs: std.ArrayList(ShapeGlyph) = .empty;
-    errdefer glyphs.deinit(alloc);
     var i = start_run;
     while (i < end_run) {
         const d = decodeOne(line, i);
         const id = adapter.mapGlyph(font, d.cp);
         const ga = attrs.get_span(i);
-        try glyphs.append(alloc, .{
+        try out.append(alloc, .{
             .start = i,
             .end = i + d.len,
             .x_advance = adapter.advanceEm(font, id) + letterSpacing(ga),
@@ -1088,6 +1088,22 @@ pub fn shapeSkipGlyphs(
         });
         i += d.len;
     }
+}
+
+/// Per-character charmap shaping (shape.rs:587-638) into a fresh slice
+/// (compat wrapper over `shapeSkipAppend`).
+pub fn shapeSkipGlyphs(
+    alloc: std.mem.Allocator,
+    adapter: ShapeAdapter,
+    font: FontId,
+    line: []const u8,
+    attrs: *const AttrsList,
+    start_run: usize,
+    end_run: usize,
+) ShapeError![]ShapeGlyph {
+    var glyphs: std.ArrayList(ShapeGlyph) = .empty;
+    errdefer glyphs.deinit(alloc);
+    try shapeSkipAppend(alloc, adapter, &glyphs, font, line, attrs, start_run, end_run);
     return glyphs.toOwnedSlice(alloc);
 }
 
@@ -1109,9 +1125,9 @@ pub fn shapeSkip(
     adapter.setWeight(query.weight);
     const font = adapter.fontFor(query) orelse adapter.primaryFont();
     const glyph_start = out.items.len;
-    const fresh = try shapeSkipGlyphs(alloc, adapter, font, line, attrs, start_run, end_run);
-    defer alloc.free(fresh);
-    try out.appendSlice(alloc, fresh);
+    // Append in place: the old shapeSkipGlyphs round-trip allocated, copied
+    // and freed a fresh slice per word on the basic path.
+    try shapeSkipAppend(alloc, adapter, out, font, line, attrs, start_run, end_run);
 
     // If any glyphs are missing and the user specified a font, fall back to a
     // default font (shape.rs:526-583). The generic family is resolved through
