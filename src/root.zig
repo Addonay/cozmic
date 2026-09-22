@@ -30,8 +30,25 @@ pub const shape_hb = @import("shape_hb.zig");
 pub const buffer_line = @import("buffer_line.zig");
 pub const buffer = @import("buffer.zig");
 pub const edit = @import("edit.zig");
-pub const vi = @import("vi.zig");
-pub const syntect = @import("syntect.zig");
+/// Feature-gated optional editors (build flags default off):
+/// `-Dvi=true` / `-Dsyntect=true` decide whether the experimental surfaces are
+/// exported at all — the default build exposes only a disabled stub, so
+/// consumers cannot silently depend on the unfinished editors, and enabling a
+/// flag is an explicit opt-in. The modules' own `vi_enabled` /
+/// `syntect_enabled` constants keep reporting *editor readiness* (false while
+/// their TODOs remain) and stay importable standalone (`zig test src/vi.zig`)
+/// without build_options — the build flag is applied here, at the export
+/// seam, which is what TODO(vi)/TODO(syntect) asked for. The test block below
+/// imports the files directly, so their suites run regardless of the flag.
+const DisabledVi = struct {
+    pub const vi_enabled: bool = false;
+};
+const DisabledSyntect = struct {
+    pub const syntect_enabled: bool = false;
+};
+const build_options = @import("build_options");
+pub const vi = if (build_options.vi) @import("vi.zig") else DisabledVi;
+pub const syntect = if (build_options.syntect) @import("syntect.zig") else DisabledSyntect;
 pub const unicode = @import("unicode.zig");
 /// Canonical type ownership contract for the integration pass.
 pub const types = @import("types.zig");

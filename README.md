@@ -54,7 +54,9 @@ zig build bench          # cozmic benchmarks (-- --quick for a smoke run)
 zig build bench-compare  # cozmic vs cosmic-text criterion side-by-side
 ```
 
-Optional features: `-Dvi`, `-Dsyntect` (default off).
+Optional features: `-Dvi`, `-Dsyntect` (default off). These gate whether the
+experimental `cozmic.vi` / `cozmic.syntect` surfaces are exported at all;
+their `*_enabled` constants separately report editor readiness.
 
 ## Benchmarks
 
@@ -78,4 +80,18 @@ results; see `zig build bench-compare -- --help` (`--quick`, `--no-rust`,
 measures an empty `FontSystem` plus a `tests/fonts` directory load; upstream's
 `FontSystem::new()` scans the host font set, so that row is not directly
 comparable across hosts.
+
+### Bench semantics: parity rows vs warm run-cache rows
+
+Standard rows **disable** the shaped-run cache so they compare like-for-like
+with cosmic-text, whose equivalent `shape-run-cache` feature is default-off.
+Rows suffixed `(run-cache warm)` enable it: the warmup pass fills the cache
+and the timed iterations measure steady state — what an editor or frame loop
+pays after the first render. The cache is **enabled by default for library
+consumers**: it lives on the shaper backend (as upstream's does on
+`FontSystem`), persists across buffers and frames, is bounded to the16k most
+recently used runs, and lets the advanced path skip shaping whenever the same
+`(run text, attrs)` recurs — hits reproduce every glyph field (byte-for-byte
+equal to fresh shaping, enforced by the image/wrap suites).
+`FontSystem.setRunCacheEnabled` / `clearRunCache` let tools flip semantics.
 

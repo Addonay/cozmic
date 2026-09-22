@@ -27,11 +27,14 @@
 //! `syntax_cache: ArrayList(CacheEntry)` + `metadata: ?usize` cascade shape
 //! (only the `parseLine` hash needs replacing).
 //!
-//! Feature gating: the parent build wires `build_options.syntect`. This file
-//! must also compile via `zig test src/syntect.zig` without that module, so
-//! it exposes a plain constant instead of importing `build_options`.
-//! TODO(syntect): wire `build_options.syntect` in the parent and gate
-//! `SyntaxEditor` on it. Until then `syntect_enabled` is always `false`.
+//! Feature gating (resolved): the parent build wires `build_options.syntect`
+//! and `root.zig` applies it — `cozmic.syntect` only exposes this file when
+//! `-Dsyntect=true` (default off; the root otherwise exports a disabled
+//! stub), so the unfinished syntax layer cannot be depended on by accident.
+//! This file still compiles standalone via `zig test src/syntect.zig` without
+//! that module, which is why `syntect_enabled` below stays a plain constant:
+//! it reports *feature readiness* (false while the TODOs above remain), not
+//! build exposure.
 
 const std = @import("std");
 

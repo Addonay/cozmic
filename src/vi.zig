@@ -26,11 +26,13 @@
 //!     oracle uses visible `layout_runs`; no scrolling here).
 //!   * `Replace` currently inserts (no overstrike); `TODO(vi)`.
 //!
-//! Feature gating: the parent build wires `build_options.vi`. This file must
-//! also compile via `zig test src/vi.zig` without that module, so it exposes
-//! a plain constant instead of importing `build_options`.
-//! TODO(vi): wire `build_options.vi` in the parent and gate `ViEditor` on it.
-//! Until then `vi_enabled` is always `false`.
+//! Feature gating (resolved): the parent build wires `build_options.vi` and
+//! `root.zig` applies it — `cozmic.vi` only exposes this file when
+//! `-Dvi=true` (default off; the root otherwise exports a disabled stub), so
+//! the unfinished editor cannot be depended on by accident. This file still
+//! compiles standalone via `zig test src/vi.zig` without that module, which
+//! is why `vi_enabled` below stays a plain constant: it reports *editor
+//! readiness* (false while the TODOs above remain), not build exposure.
 
 const std = @import("std");
 
