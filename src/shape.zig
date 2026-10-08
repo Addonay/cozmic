@@ -2648,10 +2648,13 @@ pub const ShapeLine = struct {
         } else {
             var total_h: f32 = 0;
             var total_n: usize = 0;
+            // Only a `Lines` limit caps the line count; a `Height` limit is
+            // enforced through `max_h_opt` alone (shape.rs:2354-2365).
             const max_n_opt: ?usize = switch (ellipsize) {
-                .start => |l| l.maxLines(),
-                .middle => |l| l.maxLines(),
-                .end => |l| l.maxLines(),
+                .start, .middle, .end => |l| switch (l) {
+                    .lines => l.maxLines(),
+                    .height => null,
+                },
                 .none => null,
             };
             const max_h_opt: ?f32 = switch (ellipsize) {

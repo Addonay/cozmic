@@ -143,6 +143,20 @@ pub fn build(b: *std.Build) void {
     b.step("bench-matched", "Run the cold-layout workloads matched by benches/upstream/matched_probe.rs")
         .dependOn(&matched_run.step);
 
+    const memory_exe = b.addExecutable(.{
+        .name = "bench-memory",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benches/memory.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .imports = &.{.{ .name = "cozmic", .module = bench_core }},
+        }),
+    });
+    const memory_run = b.addRunArtifact(memory_exe);
+    memory_run.setCwd(b.path("."));
+    b.step("bench-memory", "Report cozmic heap usage per phase of the matched workload")
+        .dependOn(&memory_run.step);
+
     // `zig build bench -- [--format json] [--quick] [--iter N] [--warmup N]`
     const bench_step = b.step("bench", "Run benchmarks (-- --quick for a fast harness smoke run)");
     var prev_bench: ?*std.Build.Step = null;

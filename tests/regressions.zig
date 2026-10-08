@@ -283,7 +283,7 @@ test "audit 3: mask and color callbacks agree on channel interpretation" {
     // RGB at full alpha, i.e. exactly the base color.
     const base = c.Color.rgba(0x11, 0x22, 0x33, 0xFF);
     const mask_key = onePixelKey(2);
-    const mask_data = try a.dupe(u8, &.{ 255 });
+    const mask_data = try a.dupe(u8, &.{255});
     try cache.image_cache.put(mask_key, .{
         .placement = .{ .left = 0, .top = 0, .width = 1, .height = 1 },
         .content = .mask,
@@ -1225,4 +1225,35 @@ test "tabs in advanced non-ASCII text shape without missing glyphs" {
     // Glyph ranges must stay inside the original byte length (8 bytes: 2 + 1
     // tab + 5 Arabic codepoints of 2 bytes each).
     try std.testing.expect(max_end <= text.len);
+}
+// ---------------------------------------------------------------------------
+// Port fixes found by the 2026-10 cosmic-text parity review
+// ---------------------------------------------------------------------------
+
+fn ellipsizedRunCount(fs: *c.FontSystem, max_height: f32) !usize {
+    var attrs = fonts.attrsWithFamily(a, "Inter");
+    defer attrs.deinit();
+    var buf = try c.Buffer.initWithAllocator(a, c.Metrics.new(20, 20));
+    defer buf.deinit();
+    buf.setWrap(.word);
+    buf.setSize(200, null);
+    buf.setEllipsize(.{ .end = .{ .height = max_height } });
+    try buf.setText("The quick brown fox jumps over the lazy dog. " ++
+        "Pack my box with five dozen liquor jugs. How vexingly quick daft zebras jump.", &attrs, .advanced, null);
+    try buf.shapeUntilScroll(fs, false);
+    var n: usize = 0;
+    var it = buf.layoutRuns();
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+test "ellipsize Height limit keeps every line that fits (was capped at 1 line)" {
+    var fs = try fonts.fontSystem(a);
+    defer fs.deinit();
+    // shape.rs: a line is the last one when height_so_far + 2 * line_height
+    // exceeds the limit. 45px at 20px lines: line 2 (20 + 40 > 45) is last.
+    try std.testing.expectEqual(@as(usize, 2), try ellipsizedRunCount(&fs, 45));
+    // 100px: lines at 0, 20, 40, 60 fit (60 + 40 = 100 is not > 100); the
+    // fifth (80 + 40 > 100) is the ellipsized last line.
+    try std.testing.expectEqual(@as(usize, 5), try ellipsizedRunCount(&fs, 100));
 }

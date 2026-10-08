@@ -297,6 +297,19 @@ pub const FontDb = struct {
         return id;
     }
 
+    /// Read-only, non-prefaulted mapping of a font file for metadata parsing.
+    fn mapFontFile(io: std.Io, path: []const u8) !std.Io.File.MemoryMap {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const file_len = try file.length(io);
+        if (file_len == 0 or file_len > MAX_FONT_BYTES) return error.InvalidFont;
+        return file.createMemoryMap(io, .{
+            .len = @intCast(file_len),
+            .protection = .{ .read = true },
+            .populate = false,
+        });
+    }
+
     /// Read one font file and insert every face it contains (collections
     /// included). Per-file failures are counted, never fatal.
     pub fn loadFontFile(
@@ -305,16 +318,15 @@ pub const FontDb = struct {
         path: []const u8,
         stats: *LoadStats,
     ) void {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(
-            io,
-            path,
-            self.allocator,
-            .limited(MAX_FONT_BYTES),
-        ) catch {
+        // Map instead of reading: only the header tables parsed below become
+        // resident, so scanning a large directory never holds a whole font
+        // file in the heap.
+        var map = mapFontFile(io, path) catch {
             stats.file_errors += 1;
             return;
         };
-        defer self.allocator.free(bytes);
+        defer map.destroy(io);
+        const bytes: []const u8 = map.memory;
         const count = font_parse.fontsInCollection(bytes);
         if (count == 0) {
             stats.file_errors += 1;

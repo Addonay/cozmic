@@ -115,11 +115,11 @@ pub const LayoutRun = struct {
             const total: f32 = @floatFromInt(@max(unicode_mod.countGraphemes(cluster), 1));
             const c_w = glyph.w / total;
             var c_x = glyph.x;
-            var off = glyph.start;
             var gx_iter = unicode_mod.graphemeIndices(cluster);
             while (gx_iter.next()) |g_start| {
-                const c_start = off + g_start;
-                const c_end = off + gx_iter.pos;
+                // Grapheme offsets are cluster-relative (buffer.rs:80-81).
+                const c_start = glyph.start + g_start;
+                const c_end = glyph.start + gx_iter.pos;
                 const selected = (cursor_start.line != self.line_i or c_end > cursor_start.index) and
                     (cursor_end.line != self.line_i or c_start < cursor_end.index);
                 if (selected) {
@@ -136,7 +136,6 @@ pub const LayoutRun = struct {
                     if (r.width > 0) try out.append(allocator, r);
                 }
                 c_x += c_w;
-                off = c_end;
             }
         }
         if (range_opt) |r| {
@@ -2613,4 +2612,42 @@ test "real RTL geometry: Hebrew levels and wrap" {
         }
     }
     try testing.expect(any_rtl_level);
+}
+
+test "highlight splits a multi-grapheme cluster at cluster-relative offsets" {
+    // One "fi" ligature glyph covering bytes 0..2, 20px wide.
+    const glyph: LayoutGlyph = .{
+        .start = 0,
+        .end = 2,
+        .font_size = 16,
+        .font_weight = attrs_mod.Weight.normal,
+        .line_height_opt = null,
+        .font_id = 0,
+        .glyph_id = 1,
+        .x = 0,
+        .y = 0,
+        .w = 20,
+        .level = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+        .color_opt = null,
+        .metadata = 0,
+        .cache_key_flags = .{},
+    };
+    const run: LayoutRun = .{
+        .line_i = 0,
+        .text = "fi",
+        .rtl = false,
+        .glyphs = &.{glyph},
+        .decorations = &.{},
+        .line_y = 0,
+        .line_top = 0,
+        .line_height = 20,
+        .line_w = 20,
+    };
+    var spans = try run.highlight(std.testing.allocator, Cursor.new(0, 1), Cursor.new(0, 2));
+    defer spans.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), spans.items.len);
+    try std.testing.expectEqual(@as(f32, 10), spans.items[0].x);
+    try std.testing.expectEqual(@as(f32, 10), spans.items[0].width);
 }
