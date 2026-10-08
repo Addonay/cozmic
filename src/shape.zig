@@ -378,6 +378,10 @@ pub const FontQuery = struct {
     stretch: u8 = 5,
     /// 0 = normal, 1 = italic, 2 = oblique.
     style: u8 = 0,
+    /// The run's primary script. A resolver whose requested family is not
+    /// installed picks the first script/common fallback as the primary
+    /// (shape.rs:326-348), which needs it.
+    script: Script = .common,
 };
 
 /// Build the adapter query for an owned attribute span.
@@ -933,7 +937,9 @@ pub fn shapeRun(
     // taken from the effective attrs at the run start; backends without a
     // database return null and keep their global primary font.
     const run_attrs = attrs.get_span(start_run);
-    const query = fontQueryFor(run_attrs);
+    var query = fontQueryFor(run_attrs);
+    const script: Script = if (buf.scripts.items.len > 0) buf.scripts.items[0] else .common;
+    query.script = script;
     // Match the backend's variation state to this run's requested weight
     // before any font-selection or shaping query (no-op for static faces).
     adapter.setWeight(query.weight);
@@ -969,7 +975,6 @@ pub fn shapeRun(
 
     // Fallback loop (shape.rs:350-425). `check_missing` diagnostics are a
     // backend logging concern and intentionally have no equivalent here.
-    const script: Script = if (buf.scripts.items.len > 0) buf.scripts.items[0] else .common;
     var attempt: usize = 0;
     while (missing.items.len > 0) {
         const fb = adapter.fallbackFor(query, script, attempt) orelse break;

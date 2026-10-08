@@ -433,25 +433,27 @@ pub const FontDb = struct {
     }
 
     fn familyMatches(self: *const FontDb, f: *const FaceInfo, family: Family) bool {
-        switch (family) {
-            .name => |n| {
-                return faceHasFamily(f, n);
-            },
-            .monospace => return f.monospaced,
-            // M1: generic families resolve via the configured default family
-            // names (fontdb `set_*_family`), not "match any face". This keeps
-            // `query(.sans_serif)` scoped to the sans default instead of
-            // returning the globally closest weight/style face.
-            .sans_serif => return faceHasFamily(f, self.sans_family),
-            .serif => return faceHasFamily(f, self.serif_family),
-            .cursive => return faceHasFamily(f, self.familyName(.cursive)),
-            .fantasy => return faceHasFamily(f, self.familyName(.fantasy)),
-        }
+        return faceHasFamily(f, self.familyName(family));
     }
 
-    /// `fontdb::Database::query` equivalent for a single family.
-    /// Among family-matching faces, picks the minimum by
-    /// (weight_diff, stretch_diff, style_diff, id).
+    fn hasFamilyFace(self: *const FontDb, family: Family) bool {
+        for (self.faces.items) |*f| {
+            if (self.familyMatches(f, family)) return true;
+        }
+        return false;
+    }
+
+    /// `fontdb::Database::query` for a single family: the candidates are the
+    /// faces carrying the family's name (generic families resolve through the
+    /// configured `set*Family` names), and the winner is chosen by the CSS
+    /// Fonts 3 matching algorithm exactly as fontdb's `find_best_match`
+    /// (stretch, then style preference, then directional weight; ties go to
+    /// the earliest registered face).
+    ///
+    /// Divergence: when no face carries the configured monospace family name,
+    /// `.monospace` falls back to every face flagged monospaced. Upstream
+    /// returns `None` there and relies on its monospace fallback phase, which
+    /// this port does not implement yet.
     pub fn query(
         self: *const FontDb,
         family: Family,
@@ -459,40 +461,91 @@ pub const FontDb = struct {
         stretch: Stretch,
         style: Style,
     ) ?FontId {
-        var best: ?FontId = null;
-        var best_score: QueryScore = undefined;
-        var first = true;
-        for (self.faces.items) |*f| {
-            if (!self.familyMatches(f, family)) continue;
-            const score = QueryScore{
-                .w = absDiffU16(weight, f.weight),
-                .s = absDiffU16(stretch.toNumber(), f.stretch.toNumber()),
-                .y = styleDiff(style, f.style),
-                .id = f.id,
-            };
-            if (first or scoreLess(score, best_score)) {
-                best = f.id;
-                best_score = score;
-                first = false;
+        const mono_flag = family == .monospace and !self.hasFamilyFace(family);
+        const Filter = struct {
+            db: *const FontDb,
+            family: Family,
+            mono_flag: bool,
+            stretch: ?Stretch = null,
+            style: ?Style = null,
+            weight: ?Weight = null,
+
+            fn ok(c: @This(), f: *const FaceInfo) bool {
+                const fam = if (c.mono_flag) f.monospaced else c.db.familyMatches(f, c.family);
+                return fam and
+                    (c.stretch == null or f.stretch == c.stretch.?) and
+                    (c.style == null or f.style == c.style.?) and
+                    (c.weight == null or f.weight == c.weight.?);
+            }
+        };
+        var filter: Filter = .{ .db = self, .family = family, .mono_flag = mono_flag };
+        const faces = self.faces.items;
+
+        // Step 4a: font-stretch.
+        const want_s = stretch.toNumber();
+        var exact_s = false;
+        var dir_s: ?u16 = null; // closest in the preferred direction
+        var any_s: ?u16 = null; // closest in the other direction
+        for (faces) |*f| {
+            if (!filter.ok(f)) continue;
+            const got = f.stretch.toNumber();
+            if (got == want_s) exact_s = true;
+            const preferred = if (stretch.toNumber() <= Stretch.normal.toNumber()) got < want_s else got > want_s;
+            if (preferred) {
+                if (dir_s == null or absDiffU16(got, want_s) < absDiffU16(dir_s.?, want_s)) dir_s = got;
+            } else if (got != want_s) {
+                if (any_s == null or absDiffU16(got, want_s) < absDiffU16(any_s.?, want_s)) any_s = got;
             }
         }
-        return best;
+        const match_s: u16 = if (exact_s) want_s else dir_s orelse any_s orelse return null;
+        filter.stretch = @as(Stretch, @fromBackingInt(@as(u8, @intCast(match_s))));
+
+        // Step 4b: font-style, by preference order.
+        const prefs: [3]Style = switch (style) {
+            .italic => .{ .italic, .oblique, .normal },
+            .oblique => .{ .oblique, .italic, .normal },
+            .normal => .{ .normal, .oblique, .italic },
+        };
+        filter.style = for (prefs) |want| {
+            const found = for (faces) |*f| {
+                if (filter.ok(f) and f.style == want) break true;
+            } else false;
+            if (found) break want;
+        } else return null;
+
+        // Step 4c: font-weight (CSS: 400-449 try 500 first, 450-500 try 400
+        // first, <= 500 searches thinner then fatter, > 500 fatter then thinner).
+        var has_exact = false;
+        var has_400 = false;
+        var has_500 = false;
+        var thinner: ?Weight = null; // closest weight <= request
+        var fatter: ?Weight = null; // closest weight >= request
+        for (faces) |*f| {
+            if (!filter.ok(f)) continue;
+            const w = f.weight;
+            if (w == weight) has_exact = true;
+            if (w == 400) has_400 = true;
+            if (w == 500) has_500 = true;
+            if (w <= weight and (thinner == null or weight - w < weight - thinner.?)) thinner = w;
+            if (w >= weight and (fatter == null or w - weight < fatter.? - weight)) fatter = w;
+        }
+        filter.weight = if (has_exact)
+            weight
+        else if (weight >= 400 and weight < 450 and has_500)
+            500
+        else if (weight >= 450 and weight <= 500 and has_400)
+            400
+        else if (weight <= 500)
+            thinner orelse fatter orelse return null
+        else
+            fatter orelse thinner orelse return null;
+
+        for (faces) |*f| {
+            if (filter.ok(f)) return f.id;
+        }
+        return null;
     }
 };
-
-const QueryScore = struct {
-    w: u16,
-    s: u16,
-    y: u8,
-    id: FontId,
-};
-
-fn scoreLess(a: QueryScore, b: QueryScore) bool {
-    if (a.w != b.w) return a.w < b.w;
-    if (a.s != b.s) return a.s < b.s;
-    if (a.y != b.y) return a.y < b.y;
-    return a.id < b.id;
-}
 
 fn absDiffU16(a: u16, b: u16) u16 {
     return if (a >= b) a - b else b - a;
@@ -882,11 +935,9 @@ fn resolverStyle(style: u8) Style {
 /// Map a `unicode.Script` onto the richer `fallback.Script` used by the
 /// vendored platform fallback tables.
 ///
-/// `unicode.Script` deliberately collapses every assigned script it does not
-/// track into `.other` (see `unicode.mapScriptType`), so only the tracked
-/// scripts can be routed to a script-specific family list. `.other`,
-/// `.common`, `.inherited`, `.latin`, `.greek` and `.cyrillic` have no
-/// fallback table and correctly fall through to the platform common list.
+/// Every script with a fallback table is tracked by `unicode.Script`.
+/// `.other`, `.common`, `.inherited`, `.latin`, `.greek` and `.cyrillic` have
+/// no table and fall through to the platform common list, as upstream.
 fn fallbackScript(script: shape_mod.Script) ?fallback.Script {
     return switch (script) {
         .armenian => .armenian,
@@ -907,6 +958,35 @@ fn fallbackScript(script: shape_mod.Script) ?fallback.Script {
         .hiragana => .hiragana,
         .katakana => .katakana,
         .hangul => .hangul,
+        .adlam => .adlam,
+        .bopomofo => .bopomofo,
+        .braille => .braille,
+        .buhid => .buhid,
+        .chakma => .chakma,
+        .cherokee => .cherokee,
+        .deseret => .deseret,
+        .ethiopic => .ethiopic,
+        .georgian => .georgian,
+        .gothic => .gothic,
+        .grantha => .grantha,
+        .gujarati => .gujarati,
+        .gurmukhi => .gurmukhi,
+        .hanunoo => .hanunoo,
+        .javanese => .javanese,
+        .mongolian => .mongolian,
+        .oriya => .oriya,
+        .runic => .runic,
+        .sinhala => .sinhala,
+        .syriac => .syriac,
+        .tagalog => .tagalog,
+        .tagbanwa => .tagbanwa,
+        .tai_le => .tai_le,
+        .tai_tham => .tai_tham,
+        .tai_viet => .tai_viet,
+        .thaana => .thaana,
+        .tifinagh => .tifinagh,
+        .vai => .vai,
+        .yi => .yi,
         else => null,
     };
 }
@@ -937,34 +1017,76 @@ const ShaperResolver = struct {
         }) catch return null;
     }
 
-    /// First usable match for `query` (lowest-id usable face in match order),
-    /// or `null` when the database has no usable registered source. OOM is
-    /// degraded to "no match" (see `matchesFor`).
+    /// `FontFallbackIter::next`'s weight gate (fallback/mod.rs:281, 299-303):
+    /// only exact-weight faces, or variable faces whose `wght` axis covers the
+    /// request, qualify as a named family's primary or as a script/common
+    /// fallback.
+    fn weightMatches(m: FontMatchKey) bool {
+        return m.font_weight_diff == 0 or m.variable_weight_match;
+    }
+
+    /// The run's primary font: the first usable match that carries the
+    /// requested family name and passes the weight gate
+    /// (`default_font_match_key`, fallback/mod.rs:279-287). `null` when the
+    /// family is not installed at a usable weight; the shaper then takes the
+    /// first `fallbackFor` candidate, exactly as upstream's iterator falls
+    /// through to its script and common phases.
+    ///
+    /// Monospace without a named match approximates upstream's monospace
+    /// phase (which also ranks by codepoint coverage of the word, unavailable
+    /// here): the first usable monospaced face in match order, i.e. the
+    /// closest weight. OOM is degraded to "no match" (see `matchesFor`).
     fn fontFor(ctx: *anyopaque, query: shape_mod.FontQuery) ?FontId {
         const self: *FontSystem = @ptrCast(@alignCast(ctx));
         const matches = matchesFor(self, query) orelse return null;
+        return effectivePrimary(self, query, query.script, matches);
+    }
+
+    /// The named-family primary, or else the first fallback candidate for
+    /// `script` (upstream's iterator falls through to its script and common
+    /// phases when the family is missing).
+    fn effectivePrimary(
+        self: *FontSystem,
+        query: shape_mod.FontQuery,
+        script: shape_mod.Script,
+        matches: []const FontMatchKey,
+    ) ?FontId {
+        if (primaryOf(self, query, matches)) |id| return id;
+        const list = candidates(self, script, matches, null);
+        return if (list.count > 0) list.ids[0] else null;
+    }
+
+    fn primaryOf(self: *FontSystem, query: shape_mod.FontQuery, matches: []const FontMatchKey) ?FontId {
+        const family = resolverFamily(query);
+        const name = self.db.familyName(family);
         for (matches) |m| {
-            if (self.canUseFontSource(m.id)) return m.id;
+            if (!weightMatches(m) or !self.canUseFontSource(m.id)) continue;
+            const face = self.db.face(m.id) orelse continue;
+            if (FontDb.faceHasFamily(face, name)) return m.id;
+        }
+        if (family == .monospace) {
+            for (matches) |m| {
+                if (self.canUseFontSource(m.id) and self.isMonospace(m.id)) return m.id;
+            }
         }
         return null;
     }
 
-    /// Fallback ordering for one candidate scan, following the phase order of
-    /// upstream `FontFallbackIter::next`:
+    /// Fallback candidates after the primary, in the phase order of upstream
+    /// `FontFallbackIter::next` (fallback/mod.rs:426-480):
     ///
-    /// 1. the run's script family list, ordered by the table itself
-    ///    (`scriptFallbackUnix`, including its Han-unification routing for the
-    ///    system locale),
-    /// 2. the platform common family list,
-    /// 3. every remaining usable match in global match order.
+    /// 1. for each family in the run script's list (`scriptFallbackUnix`,
+    ///    locale-aware Han unification included), the first weight-gated
+    ///    usable face of that family,
+    /// 2. the same for each platform common family,
+    /// 3. every remaining usable match in global match order (no weight
+    ///    gate; the unix forbidden list is empty).
     ///
-    /// The primary (which `fontFor` already returned, i.e. the first usable
-    /// match in global order) is excluded, and no font is offered twice —
-    /// upstream's `seen` set — so `attempt` indexes a deduplicated candidate
-    /// list. The result depends only on `(query, script, attempt)` and the
-    /// current usable set, never on which font `fontFor` returned or on
-    /// previous `fallbackFor` calls, so probing attempts out of order (or after
-    /// a primary retry) stays well-defined and the fallback memo can key on it.
+    /// The primary is excluded and no font is offered twice (upstream re-offers
+    /// duplicates, which can only repeat an already failed shaping attempt),
+    /// so `attempt` indexes a deduplicated list. The result depends only on
+    /// `(query, script, attempt)` and the usable set, so out-of-order probing
+    /// stays well-defined and the fallback memo can key on it.
     ///
     /// Not yet wired: the monospace-buffer phase, which upstream ranks by
     /// `(weight diff, non-matching codepoints in the word)`. That ranking
@@ -977,79 +1099,65 @@ const ShaperResolver = struct {
     ) ?FontId {
         const self: *FontSystem = @ptrCast(@alignCast(ctx));
         const matches = matchesFor(self, query) orelse return null;
+        const primary = effectivePrimary(self, query, script, matches);
+        const list = candidates(self, script, matches, primary);
+        if (list.full) return null;
+        return if (attempt < list.count) list.ids[attempt] else null;
+    }
 
-        // Candidate ids in phase order, deduplicated (upstream's `seen` set).
-        //
-        // `fallbackFor` cannot report errors, so this uses a bounded stack
-        // buffer instead of allocating. Overflow degrades to "list exhausted",
-        // matching the OOM-as-no-match policy documented on `matchesFor`; it
-        // only happens with more than MAX_FALLBACK_CANDIDATES usable faces,
-        // where the remaining faces are increasingly unlikely to cover anything
-        // the earlier ones do not.
-        var candidates: [MAX_FALLBACK_CANDIDATES]FontId = undefined;
-        var count: usize = 0;
-        var full = false;
+    /// Phase-ordered, deduplicated candidates excluding `primary`.
+    /// `fallbackFor` cannot report errors, so they live in a bounded stack
+    /// buffer. Overflow degrades to "list exhausted" (the OOM-as-no-match
+    /// policy of `matchesFor`); it needs more than MAX_FALLBACK_CANDIDATES
+    /// usable faces.
+    fn candidates(
+        self: *FontSystem,
+        script: shape_mod.Script,
+        matches: []const FontMatchKey,
+        primary: ?FontId,
+    ) Candidates {
+        var list: Candidates = .{ .primary = primary };
 
-        const offer = struct {
-            fn add(dst: []FontId, n: *usize, saturated: *bool, id: FontId) void {
-                for (dst[0..n.*]) |seen| {
-                    if (seen == id) return;
-                }
-                if (n.* == dst.len) {
-                    saturated.* = true;
-                    return;
-                }
-                dst[n.*] = id;
-                n.* += 1;
-            }
-        }.add;
-
-        // The primary, which `fontFor` already returned: the first usable match
-        // in global order. Upstream consumes it from the same iterator before
-        // the fallback loop starts, so it must never reappear as a candidate.
-        // Phase reordering means it is not necessarily `candidates[0]`, so it is
-        // identified by its global position, not by its place in the list.
-        var primary: ?FontId = null;
-        for (matches) |m| {
-            if (!self.canUseFontSource(m.id)) continue;
-            primary = m.id;
-            break;
-        }
-
-        // Phase 1: script-specific families (locale-aware, Han unification
-        // included, straight from the vendored `unix.rs` tables).
-        if (fallbackScript(script)) |fs| {
-            for (fallback.scriptFallbackUnix(fs, self.locale)) |family_name| {
+        const family_lists = [_][]const []const u8{
+            if (fallbackScript(script)) |fs| fallback.scriptFallbackUnix(fs, self.locale) else &.{},
+            fallback.PLATFORM_COMMON_FALLBACK,
+        };
+        for (family_lists) |families| {
+            for (families) |family_name| {
                 for (matches) |m| {
-                    if (!self.canUseFontSource(m.id)) continue;
-                    if (m.id == primary) continue;
+                    if (!weightMatches(m) or !self.canUseFontSource(m.id)) continue;
                     const face = self.db.face(m.id) orelse continue;
                     if (!FontDb.faceHasFamily(face, family_name)) continue;
-                    offer(&candidates, &count, &full, m.id);
+                    list.offer(m.id);
+                    break;
                 }
             }
         }
-        // Phase 2: platform common families.
-        for (fallback.PLATFORM_COMMON_FALLBACK) |family_name| {
-            for (matches) |m| {
-                if (!self.canUseFontSource(m.id)) continue;
-                const face = self.db.face(m.id) orelse continue;
-                if (!FontDb.faceHasFamily(face, family_name)) continue;
-                offer(&candidates, &count, &full, m.id);
-            }
-        }
-        // Phase 3: global match order (broad coverage, no script preference).
         for (matches) |m| {
-            if (!self.canUseFontSource(m.id)) continue;
-            if (m.id == primary) continue;
-            offer(&candidates, &count, &full, m.id);
+            if (self.canUseFontSource(m.id)) list.offer(m.id);
         }
-        if (full) return null;
-
-        // `attempt` indexes the candidate list, which already excludes the
-        // primary, so attempt 0 is the best-ranked fallback.
-        return if (attempt < count) candidates[attempt] else null;
+        return list;
     }
+
+    const Candidates = struct {
+        ids: [MAX_FALLBACK_CANDIDATES]FontId = undefined,
+        count: usize = 0,
+        full: bool = false,
+        primary: ?FontId,
+
+        fn offer(self: *Candidates, id: FontId) void {
+            if (self.primary == id) return;
+            for (self.ids[0..self.count]) |seen| {
+                if (seen == id) return;
+            }
+            if (self.count == self.ids.len) {
+                self.full = true;
+                return;
+            }
+            self.ids[self.count] = id;
+            self.count += 1;
+        }
+    };
 };
 
 pub const FontSystem = struct {
@@ -1891,6 +1999,35 @@ test "face query picks closest weight and style" {
     const picked = db.query(.{ .name = "S" }, 400, .normal, .italic);
     try t.expect(picked != null);
     try t.expectEqualStrings("S-Italic", db.face(picked.?).?.post_script_name);
+}
+
+test "FontDb.query follows fontdb's CSS matching order" {
+    const t = std.testing;
+    var db = try FontDb.init(t.allocator);
+    defer db.deinit();
+    // Weight <= 500 searches thinner first: 300 picks 200 over 400.
+    _ = try db.addFace("/w4.ttf", 0, &.{"W"}, "W-400", 400, .normal, .normal, false);
+    const thin = try db.addFace("/w2.ttf", 0, &.{"W"}, "W-200", 200, .normal, .normal, false);
+    try t.expectEqual(@as(?FontId, thin), db.query(.{ .name = "W" }, 300, .normal, .normal));
+    // Weight > 500 searches fatter first: 600 picks 800 over 400.
+    const fat = try db.addFace("/w8.ttf", 0, &.{"W"}, "W-800", 800, .normal, .normal, false);
+    try t.expectEqual(@as(?FontId, fat), db.query(.{ .name = "W" }, 600, .normal, .normal));
+    // 400-449 tries 500 first.
+    const medium = try db.addFace("/w5.ttf", 0, &.{"W"}, "W-500", 500, .normal, .normal, false);
+    try t.expectEqual(@as(?FontId, medium), db.query(.{ .name = "W" }, 420, .normal, .normal));
+    // Style is decided before weight: an italic request takes Italic 700
+    // over Normal 400.
+    _ = try db.addFace("/sn.ttf", 0, &.{"S"}, "S-400", 400, .normal, .normal, false);
+    const italic_bold = try db.addFace("/si.ttf", 0, &.{"S"}, "S-700i", 700, .normal, .italic, false);
+    try t.expectEqual(@as(?FontId, italic_bold), db.query(.{ .name = "S" }, 400, .normal, .italic));
+    // A normal request prefers Oblique over Italic when Normal is absent.
+    _ = try db.addFace("/oi.ttf", 0, &.{"O"}, "O-i", 400, .normal, .italic, false);
+    const oblique = try db.addFace("/oo.ttf", 0, &.{"O"}, "O-o", 400, .normal, .oblique, false);
+    try t.expectEqual(@as(?FontId, oblique), db.query(.{ .name = "O" }, 400, .normal, .normal));
+    // Stretch is decided first: a condensed request takes the narrower face.
+    _ = try db.addFace("/xn.ttf", 0, &.{"X"}, "X-n", 400, .normal, .normal, false);
+    const narrow = try db.addFace("/xc.ttf", 0, &.{"X"}, "X-c", 700, .extra_condensed, .normal, false);
+    try t.expectEqual(@as(?FontId, narrow), db.query(.{ .name = "X" }, 400, .condensed, .normal));
 }
 
 test "get font matches sorts and moves query to front" {

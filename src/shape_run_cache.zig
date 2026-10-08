@@ -335,8 +335,6 @@ const TestKey = struct {
     }
 
     /// Mutable view for tests that need to vary one key field per call.
-    
-
     fn refRtl(self: *TestKey, text: []const u8, spans: []const AttrSpan) KeyRef {
         return .{ .text = text, .default_attrs = &self.default_attrs, .spans = spans, .rtl = true };
     }

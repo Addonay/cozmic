@@ -182,11 +182,10 @@ pub fn isAsciiWhitespace(cp: CodePoint) bool {
 // ---------------------------------------------------------------------------
 
 /// UAX#24 script values relevant to cozmic shaping/font fallback.
-/// Superset of `shape.zig:Script` (which stops at devanagari/thai and folds
-/// Bengali/Tamil/Khmer/etc into `unknown`/`other`); variant names for the
-/// shared scripts are spelled identically so `collectScripts` filtering
-/// (`Common|Inherited|Latin|Unknown` skipped) ports verbatim. Any assigned
-/// script outside this list maps to `.other`.
+/// The scripts cozmic distinguishes: the `collectScripts` skip set
+/// (`Common|Inherited|Latin|Unknown`, shape.rs:313-322) plus every script
+/// with a platform fallback family list, so font fallback can route each to
+/// its table. Any other assigned script maps to `.other`.
 pub const Script = enum {
     common,
     inherited,
@@ -211,6 +210,36 @@ pub const Script = enum {
     hiragana,
     katakana,
     hangul,
+    // Scripts with a platform fallback family list (fallback/unix.rs).
+    adlam,
+    bopomofo,
+    braille,
+    buhid,
+    chakma,
+    cherokee,
+    deseret,
+    ethiopic,
+    georgian,
+    gothic,
+    grantha,
+    gujarati,
+    gurmukhi,
+    hanunoo,
+    javanese,
+    mongolian,
+    oriya,
+    runic,
+    sinhala,
+    syriac,
+    tagalog,
+    tagbanwa,
+    tai_le,
+    tai_tham,
+    tai_viet,
+    thaana,
+    tifinagh,
+    vai,
+    yi,
     unknown,
     other,
 };
@@ -240,6 +269,35 @@ fn mapScriptType(s: ezi.scripts.ScriptType) Script {
         .hiragana => .hiragana,
         .katakana => .katakana,
         .hangul => .hangul,
+        .adlam => .adlam,
+        .bopomofo => .bopomofo,
+        .braille => .braille,
+        .buhid => .buhid,
+        .chakma => .chakma,
+        .cherokee => .cherokee,
+        .deseret => .deseret,
+        .ethiopic => .ethiopic,
+        .georgian => .georgian,
+        .gothic => .gothic,
+        .grantha => .grantha,
+        .gujarati => .gujarati,
+        .gurmukhi => .gurmukhi,
+        .hanunoo => .hanunoo,
+        .javanese => .javanese,
+        .mongolian => .mongolian,
+        .oriya => .oriya,
+        .runic => .runic,
+        .sinhala => .sinhala,
+        .syriac => .syriac,
+        .tagalog => .tagalog,
+        .tagbanwa => .tagbanwa,
+        .tai_le => .tai_le,
+        .tai_tham => .tai_tham,
+        .tai_viet => .tai_viet,
+        .thaana => .thaana,
+        .tifinagh => .tifinagh,
+        .vai => .vai,
+        .yi => .yi,
         .unknown => .unknown,
         else => .other,
     };
@@ -1504,32 +1562,10 @@ test "delegation: properties equal ezi tables over representative ranges" {
         }
 
         fn script(s: Script) ?ezi.scripts.ScriptType {
+            // Every tracked variant shares its name with ezi's enum.
             return switch (s) {
-                .common => .common,
-                .inherited => .inherited,
-                .latin => .latin,
-                .greek => .greek,
-                .cyrillic => .cyrillic,
-                .armenian => .armenian,
-                .hebrew => .hebrew,
-                .arabic => .arabic,
-                .devanagari => .devanagari,
-                .bengali => .bengali,
-                .tamil => .tamil,
-                .telugu => .telugu,
-                .kannada => .kannada,
-                .malayalam => .malayalam,
-                .thai => .thai,
-                .lao => .lao,
-                .tibetan => .tibetan,
-                .myanmar => .myanmar,
-                .khmer => .khmer,
-                .han => .han,
-                .hiragana => .hiragana,
-                .katakana => .katakana,
-                .hangul => .hangul,
-                .unknown => .unknown,
                 .other => null,
+                inline else => |t| @field(ezi.scripts.ScriptType, @tagName(t)),
             };
         }
     };

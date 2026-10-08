@@ -1257,3 +1257,27 @@ test "ellipsize Height limit keeps every line that fits (was capped at 1 line)" 
     // fifth (80 + 40 > 100) is the ellipsized last line.
     try std.testing.expectEqual(@as(usize, 5), try ellipsizedRunCount(&fs, 100));
 }
+
+/// Family names of the faces that shaped `text` under `family`.
+fn shapedFamily(fs: *c.FontSystem, family: []const u8, text: []const u8) ![]const u8 {
+    var attrs = fonts.attrsWithFamily(a, family);
+    defer attrs.deinit();
+    var buf = try c.Buffer.initWithAllocator(a, c.Metrics.new(20, 24));
+    defer buf.deinit();
+    try buf.setText(text, &attrs, .advanced, null);
+    try buf.shapeUntilScroll(fs, false);
+    var it = buf.layoutRuns();
+    const run = it.next() orelse return error.TestUnexpectedResult;
+    const face = fs.db.face(run.glyphs[0].font_id) orelse return error.TestUnexpectedResult;
+    return face.families[0];
+}
+
+test "a missing family falls through to the common fallback list" {
+    var fs = try fonts.fontSystem(a);
+    defer fs.deinit();
+    // fallback/mod.rs: no face named "Nonexistent" -> script phase (none for
+    // Latin) -> common list, whose first installed entry is "Noto Sans".
+    try std.testing.expectEqualStrings("Noto Sans", try shapedFamily(&fs, "Nonexistent", "Hello"));
+    // An installed family still wins.
+    try std.testing.expectEqualStrings("Inter", try shapedFamily(&fs, "Inter", "Hello"));
+}
