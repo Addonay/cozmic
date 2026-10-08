@@ -633,7 +633,11 @@ pub const Editor = struct {
             const item = parts.items[front];
             front += 1;
             const data_line = data[item.start..item.end];
-            var piece = try final_attrs.split_off(data_line.len);
+            // Split after the line *and its ending*, so `final_attrs` starts
+            // at the second line. Upstream splits at `data_line.len()` only
+            // (editor.rs:374), which shifts every later line's spans by the
+            // ending's length; fixed here deliberately.
+            var piece = try final_attrs.split_off(data_line.len + item.ending.asStr().len);
             std.mem.swap(AttrsList, &final_attrs, &piece);
             var tmp = BufferLine.initOwned(allocator, data_line, item.ending, piece, .advanced) catch |e| {
                 var p = piece;
@@ -651,8 +655,9 @@ pub const Editor = struct {
             const item = parts.items[back];
             const data_line = data[item.start..item.end];
             remaining -= data_line.len + item.ending.asStr().len;
-            var piece = try final_attrs.split_off(remaining);
-            std.mem.swap(AttrsList, &final_attrs, &piece);
+            // Unlike the first line, later lines take the suffix directly
+            // (editor.rs:391-392).
+            const piece = try final_attrs.split_off(remaining);
             // Scope the errdefer to the insert so later errors cannot
             // double-free the line now owned by `buf`.
             {
@@ -675,8 +680,7 @@ pub const Editor = struct {
                 const m = parts.items[back];
                 const mline = data[m.start..m.end];
                 remaining -= mline.len + m.ending.asStr().len;
-                var mpiece = try final_attrs.split_off(remaining);
-                std.mem.swap(AttrsList, &final_attrs, &mpiece);
+                const mpiece = try final_attrs.split_off(remaining);
                 var mtmp = BufferLine.initOwned(allocator, mline, m.ending, mpiece, .advanced) catch |e| {
                     var p = mpiece;
                     p.deinit();
@@ -874,6 +878,9 @@ pub const Editor = struct {
                     const end = self.cursor;
                     if (self.cursor.index > 0) {
                         // Whole UAX #29 grapheme cluster before the cursor.
+                        // Intentional divergence: upstream removes one
+                        // codepoint (editor.rs:582-589), which strands a
+                        // combining mark or a ZWJ-sequence fragment.
                         self.cursor.index = unicode.prevGraphemeStart(
                             self.buffer().lines.items[self.cursor.line].textSlice(),
                             self.cursor.index,
@@ -889,12 +896,18 @@ pub const Editor = struct {
             },
             .delete => {
                 if (!(try self.deleteSelection())) {
-                    const start = self.cursor;
+                    var start = self.cursor;
                     var end = self.cursor;
                     const text = self.buffer().lines.items[start.line].textSlice();
                     if (start.index < text.len) {
-                        // Whole UAX #29 grapheme cluster at the cursor.
-                        end.index = unicode.nextGraphemeEnd(text, start.index);
+                        // The whole grapheme containing the cursor, even when
+                        // the cursor sits inside it (editor.rs:611-625).
+                        var it = unicode.graphemeIndices(text);
+                        while (it.next()) |g_start| {
+                            if (g_start > start.index) break;
+                            start.index = g_start;
+                            end.index = it.pos;
+                        }
                     } else if (start.line + 1 < self.buffer().lines.items.len) {
                         end.line += 1;
                         end.index = 0;
@@ -1604,6 +1617,31 @@ test "insert_at splits lines and lands cursor" {
     try std.testing.expect(ed.buffer().lines.items.len == 3);
 }
 
+test "insert_at gives later lines their own attribute spans" {
+    const alloc = std.testing.allocator;
+    var ed = try Editor.init(alloc);
+    defer ed.deinit();
+    // "a\nbc\nde": span B (metadata 7) on 'c' (byte 3) and 'e' (byte 6).
+    var base = attrs.Attrs.init(alloc);
+    defer base.deinit();
+    var marked = attrs.Attrs.init(alloc);
+    defer marked.deinit();
+    _ = marked.with_metadata(7);
+    var list = try AttrsList.init(alloc, &base);
+    try list.add_span(3, 4, &marked);
+    try list.add_span(6, 7, &marked);
+    _ = try ed.insertAt(Cursor.new(0, 0), "a\nbc\nde", list);
+
+    const lines = ed.buffer().lines.items;
+    try std.testing.expectEqual(@as(usize, 3), lines.len);
+    // Each later line keeps its own marked character (see the first-line
+    // split comment in `insertAt` for the upstream off-by-one fixed here).
+    try std.testing.expectEqual(@as(usize, 0), lines[1].attrs_list.get_span(0).metadata);
+    try std.testing.expectEqual(@as(usize, 7), lines[1].attrs_list.get_span(1).metadata);
+    try std.testing.expectEqual(@as(usize, 0), lines[2].attrs_list.get_span(0).metadata);
+    try std.testing.expectEqual(@as(usize, 7), lines[2].attrs_list.get_span(1).metadata);
+}
+
 test "selection bounds normal/line/word" {
     const alloc = std.testing.allocator;
     var ed = try Editor.init(alloc);
@@ -1719,6 +1757,24 @@ test "copy and delete selection" {
     try std.testing.expectEqualStrings("far\nbaz", t.items);
     try std.testing.expect(ed.cursor.line == 0 and ed.cursor.index == 1);
     try std.testing.expect(!try ed.deleteSelection());
+}
+
+test "delete inside a grapheme removes the whole enclosing grapheme" {
+    const alloc = std.testing.allocator;
+    var fsys = try FontSystem.init(alloc);
+    defer fsys.deinit();
+    var ed = try Editor.init(alloc);
+    defer ed.deinit();
+    // "e" + U+0301 COMBINING ACUTE (2 bytes) + "x".
+    _ = try ed.insertAt(Cursor.new(0, 0), "e\u{301}x", null);
+
+    // Delete with the cursor inside "e\u{301}" removes the whole grapheme.
+    ed.cursor = Cursor.new(0, 1);
+    try ed.action(&fsys, .delete);
+    var t = try ed.fullText();
+    defer t.deinit(alloc);
+    try std.testing.expectEqualStrings("x", t.items);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.index);
 }
 
 test "action insert/enter/backspace/delete" {
