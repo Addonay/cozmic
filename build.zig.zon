@@ -40,6 +40,28 @@
             .url = "https://github.com/shaik-abdul-thouhid/ezi-code/archive/f01d7e8c5976eb51048beaf6b26166b37ca467c7.tar.gz",
             .hash = "ezi_code-0.5.0-dev-05Rjj1E91AAxKYNXEOCXa3prlWT2wZqmP-_ltCl-yvlc",
         },
+        // C libraries bundled by default (tools/clibs.zig). Lazy, so
+        // `-Dsystem-libs` builds never fetch them.
+        .harfbuzz = .{
+            .url = "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/14.1.0.tar.gz",
+            .hash = "N-V-__8AAJ5J4QV1Qw46kP_V9eNRdRVk9Cp65YNLuECHurpK",
+            .lazy = true,
+        },
+        .freetype = .{
+            .url = "https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz",
+            .hash = "N-V-__8AAJo-LAHFNfa0p0oMQqmwlBEAZMOeo03azXgrKLTT",
+            .lazy = true,
+        },
+        .zlib = .{
+            .url = "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
+            .hash = "N-V-__8AAJj_QgDBhU17TCtcvdjOZZPDfkvxrEAyZkc14VN8",
+            .lazy = true,
+        },
+        .libpng = .{
+            .url = "https://download.sourceforge.net/libpng/libpng-1.6.50.tar.xz",
+            .hash = "N-V-__8AAGrVXwC00HYe0ep6gbt70MXihr_woI0886_w8tD8",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

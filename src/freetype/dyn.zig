@@ -23,7 +23,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dynload = @import("dynload");
-const c = @import("c.zig").c;
+/// The runtime-bound twin, used only for `-Dsystem-libs`. A bundled build
+/// links the C library statically, so every entry point below short-circuits.
+const c = @import("c_bindings_dyn.zig");
+const bundled = @import("link_options").bundled;
 
 /// Error set of `ensureLoaded`, kept explicit because callers switch on it.
 const LoadError = error{ LibraryUnavailable, MissingSymbol };
@@ -119,11 +122,13 @@ fn candidates() []const []const u8 {
 /// loaded library is intentionally never unloaded, including after a partial
 /// bind, so no bound pointer is ever left dangling.
 pub fn ensureLoaded() error{ LibraryUnavailable, MissingSymbol }!void {
+    if (bundled) return;
     return runtime.ensure(candidates(), c.loadDynamic);
 }
 
 /// True once `ensureLoaded` has succeeded. Test/introspection helper.
 pub fn isLoaded() bool {
+    if (bundled) return true;
     return runtime.isLoaded();
 }
 
@@ -132,6 +137,7 @@ pub fn isLoaded() bool {
 // ---------------------------------------------------------------------------
 
 test "ensureLoaded loads the system FreeType and binds functions" {
+    if (bundled) return error.SkipZigTest;
     try ensureLoaded();
     try std.testing.expect(isLoaded());
 
@@ -158,6 +164,7 @@ fn bindThenFail(lib: *dynload.Library) LoadError!void {
 }
 
 test "a missing symbol is retained and the partially bound library stays loaded" {
+    if (bundled) return error.SkipZigTest;
     var rt: Runtime = .{};
     try std.testing.expectError(error.MissingSymbol, rt.ensure(candidates(), bindThenFail));
     try std.testing.expectEqual(Runtime.State.failed, rt.state);
@@ -176,6 +183,7 @@ test "a missing symbol is retained and the partially bound library stays loaded"
 }
 
 test "a missing library failure is retained verbatim" {
+    if (bundled) return error.SkipZigTest;
     var rt: Runtime = .{};
     const missing = [_][]const u8{"libcozmic-missing-library-9f3d.so"};
     try std.testing.expectError(error.LibraryUnavailable, rt.ensure(&missing, c.loadDynamic));
@@ -185,6 +193,7 @@ test "a missing library failure is retained verbatim" {
 }
 
 test "concurrent first load is serialized" {
+    if (bundled) return error.SkipZigTest;
     var rt: Runtime = .{};
     var failed = std.atomic.Value(bool).init(false);
     const Worker = struct {

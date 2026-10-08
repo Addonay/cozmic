@@ -42,6 +42,7 @@ const raster_ft = @import("raster_ft.zig");
 const glyph_cache = @import("glyph_cache.zig");
 const font_system = @import("font_system.zig");
 const dynload = @import("dynload");
+const font_blob = @import("font_blob.zig");
 /// Outline command type (type-only back-reference; `swash_cache` imports this
 /// file for the `Raster` field, and neither layout depends on the other —
 /// Zig resolves the accepted cycle, see raster_ft.zig).
@@ -49,13 +50,14 @@ const swash_cache_mod = @import("swash_cache.zig");
 
 /// Upper bound for lazily reading a single font file (64 MiB), matching the
 /// other font readers in this port.
-pub const MAX_SOURCE_BYTES: usize = 1 << 26;
+pub const MAX_SOURCE_BYTES: usize = font_blob.MAX_BYTES;
 
-/// Where a registered face's bytes come from. All memory (the byte copy or
-/// the path string) is owned by the `FaceEntry`.
+/// Where a registered face's bytes come from. The entry holds one reference
+/// to the blob and owns the path string.
 pub const FaceSource = union(enum) {
-    /// Eagerly registered owned bytes (`Raster.addFont`); loaded immediately.
-    bytes: []u8,
+    /// Eagerly registered bytes (`Raster.addFont`/`addFontBlob`); loaded
+    /// immediately.
+    blob: *font_blob.Blob,
     /// Lazily loaded file registered by `Raster.addFontSource`; read on first
     /// `rasterize`/`getFace`.
     path: struct {
@@ -64,13 +66,14 @@ pub const FaceSource = union(enum) {
     },
 };
 
-/// One registered font: the cozmic id, its source, the owned byte copy
-/// FreeType borrows (once loaded), and the live face.
+/// One registered font: the cozmic id, its source, the bytes FreeType
+/// borrows (once loaded), and the live face.
 pub const FaceEntry = struct {
     font_id: u32,
     source: FaceSource,
-    /// Owned bytes once loaded; aliases `source.bytes` for eager entries.
-    bytes: ?[]u8 = null,
+    /// Bytes once loaded; aliases `source.blob` for eager entries (one shared
+    /// reference), or the mapped file for lazy ones (its own reference).
+    blob: ?*font_blob.Blob = null,
     face: ?raster_ft.Face = null,
     loaded: bool = false,
     /// Negative cache: a failed lazy load is not retried on every call.
@@ -84,11 +87,11 @@ pub const FaceEntry = struct {
     fn destroy(self: *FaceEntry, allocator: std.mem.Allocator) void {
         if (self.face) |*face| face.deinit();
         switch (self.source) {
-            // `self.bytes` aliases `source.bytes` for eager entries, so free
-            // the source allocation exactly once.
-            .bytes => |bytes| allocator.free(bytes),
+            // `self.blob` aliases `source.blob` for eager entries: one
+            // reference, released once.
+            .blob => |blob| blob.release(),
             .path => |p| {
-                if (self.bytes) |bytes| allocator.free(bytes);
+                if (self.blob) |blob| blob.release();
                 allocator.free(p.path);
             },
         }
@@ -96,21 +99,6 @@ pub const FaceEntry = struct {
     }
 };
 
-/// Read a lazily registered font file. `Raster` has no `std.Io` parameter, so
-/// lazy loads go through the process-wide single-threaded I/O instance;
-/// callers that own a real `Io` can still register bytes eagerly. The read is
-/// serialized against shapers and rasters by the shared source I/O mutex;
-/// per-raster state (entries, `FT_Face`s) is still single-threaded by contract.
-fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    dynload.source_io_mutex.lock();
-    defer dynload.source_io_mutex.unlock();
-    return std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        path,
-        allocator,
-        .limited(MAX_SOURCE_BYTES),
-    );
-}
 
 /// Registry of FreeType faces, one per cozmic `font_id`.
 pub const Raster = struct {
@@ -144,7 +132,16 @@ pub const Raster = struct {
     /// repeated `font_id` replaces the previous entry (last registration
     /// wins), matching `shape_hb.Backend.addFont`.
     pub fn addFont(self: *Raster, font_id: u32, bytes: []const u8, index: i32) !void {
-        const entry = try self.makeEntry(font_id, bytes, index);
+        const blob = try font_blob.Blob.copy(self.allocator, bytes);
+        defer blob.release();
+        try self.addFontBlob(font_id, blob, index);
+    }
+
+    /// `addFont` without the copy: the entry retains `blob` (typically the
+    /// shaper's), so a face costs its bytes once. The caller keeps its own
+    /// reference.
+    pub fn addFontBlob(self: *Raster, font_id: u32, blob: *font_blob.Blob, index: i32) !void {
+        const entry = try self.makeEntry(font_id, blob, index);
         try self.insertEntry(entry);
     }
 
@@ -206,8 +203,16 @@ pub const Raster = struct {
             }
         }
         for (ids) |id| {
-            if (fs.fontBytes(id)) |bytes| {
-                try self.addFont(id, bytes, 0);
+            // Keep the collection face index when the database knows it;
+            // single-face files use 0.
+            const index: i32 = if (fs.db.face(id)) |f|
+                (if (f.index <= std.math.maxInt(i32)) @intCast(f.index) else 0)
+            else
+                0;
+            // Share the shaper's bytes (eager, or a lazy file it already
+            // mapped) instead of copying them.
+            if (fs.fontBlob(id)) |blob| {
+                try self.addFontBlob(id, blob, index);
                 continue;
             }
             const path = fs.fontSourcePath(id) orelse return error.FontNotRegistered;
@@ -215,12 +220,6 @@ pub const Raster = struct {
             // fail because of it. Re-registering the id later replaces the
             // entry with a fresh lazy source.
             if (!fs.canUseFontSource(id)) continue;
-            // Keep the collection face index when the database knows it;
-            // single-face files use 0.
-            const index: i32 = if (fs.db.face(id)) |f|
-                (if (f.index <= std.math.maxInt(i32)) @intCast(f.index) else 0)
-            else
-                0;
             try self.addFontSource(id, path, index);
         }
     }
@@ -372,24 +371,20 @@ pub const Raster = struct {
         return try face.outlineCommands(alloc, glyph_id, font_size, flags.contains(glyph_cache.CacheKeyFlags.FAKE_ITALIC));
     }
 
-    fn makeEntry(self: *Raster, font_id: u32, bytes: []const u8, index: i32) !FaceEntry {
-        const owned = try self.allocator.dupe(u8, bytes);
-        errdefer self.allocator.free(owned);
+    fn makeEntry(self: *Raster, font_id: u32, blob: *font_blob.Blob, index: i32) !FaceEntry {
         var entry = FaceEntry{
             .font_id = font_id,
-            .source = .{ .bytes = owned },
-            .bytes = owned,
+            .source = .{ .blob = blob },
+            .blob = blob,
         };
         try self.populate(&entry, index);
+        _ = blob.retain();
         return entry;
     }
 
     /// Build the FreeType face for `entry` from its bytes (already populated).
     fn populate(self: *Raster, entry: *FaceEntry, index: i32) !void {
-        const bytes = switch (entry.source) {
-            .bytes => |b| b,
-            .path => entry.bytes orelse return error.FontUnavailable,
-        };
+        const bytes = (entry.blob orelse return error.FontUnavailable).bytes;
         entry.face = try raster_ft.Face.initMemory(&self.library, bytes, index);
         entry.loaded = true;
     }
@@ -431,16 +426,18 @@ pub const Raster = struct {
     fn loadEntry(self: *Raster, entry: *FaceEntry) !void {
         const source = switch (entry.source) {
             // Eager sources are loaded by `makeEntry`.
-            .bytes => return,
+            .blob => return,
             .path => |p| p,
         };
-        const bytes = readSourceFile(self.allocator, source.path) catch |err| {
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.FontUnavailable;
+        const blob = blk: {
+            dynload.source_io_mutex.lock();
+            defer dynload.source_io_mutex.unlock();
+            break :blk try font_blob.open(self.allocator, source.path);
         };
-        entry.bytes = bytes;
+        entry.blob = blob;
         self.populate(entry, source.index) catch |err| {
-            entry.bytes = null;
-            self.allocator.free(bytes);
+            entry.blob = null;
+            blob.release();
             return err;
         };
     }
@@ -1084,7 +1081,7 @@ test "replacing a loaded lazy entry with eager bytes frees the old face" {
     const first_w = first.width;
     try testing.expect(first_w > 0);
     try testing.expectEqual(@as(usize, 1), raster.loadedCount());
-    try testing.expect(raster.faces.items[0].bytes != null);
+    try testing.expect(raster.faces.items[0].blob != null);
 
     // Same id, eager bytes: `insertEntry` destroys the loaded lazy entry
     // (face, lazy byte copy, path) before installing the eager copy. Running
@@ -1093,7 +1090,7 @@ test "replacing a loaded lazy entry with eager bytes frees the old face" {
     try testing.expectEqual(@as(usize, 1), raster.faces.items.len);
     try testing.expectEqual(@as(usize, 1), raster.loadedCount());
     switch (raster.faces.items[0].source) {
-        .bytes => {},
+        .blob => {},
         .path => return error.TestUnexpectedResult,
     }
 

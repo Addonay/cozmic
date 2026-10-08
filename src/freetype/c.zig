@@ -16,4 +16,7 @@
 //!
 //! The library code in this directory (`Library.zig`, `face.zig`, ...) refers
 //! to `c.FT_*` names exactly as the original `@cImport` version did.
-pub const c = @import("c_bindings_dyn.zig");
+pub const c = if (@import("link_options").bundled)
+    @import("c_bindings.zig")
+else
+    @import("c_bindings_dyn.zig");

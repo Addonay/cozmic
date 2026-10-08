@@ -125,6 +125,7 @@ pub const ShapingError = shape.ShapeError;
 
 test {
     _ = @import("layout.zig");
+    _ = @import("font_blob.zig");
     _ = @import("render.zig");
     _ = @import("bidi_para.zig");
     _ = @import("cursor.zig");

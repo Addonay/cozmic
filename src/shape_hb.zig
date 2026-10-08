@@ -77,6 +77,7 @@ const font_mod = @import("font.zig");
 const shape_mod = @import("shape.zig");
 const hb = @import("harfbuzz");
 const dynload = @import("dynload");
+const font_blob = @import("font_blob.zig");
 
 /// Runtime HarfBuzz version string, e.g. `"14.1.0"`. Loads the shared library
 /// on first use; returns `""` when HarfBuzz cannot be loaded (the fallible
@@ -127,13 +128,13 @@ pub fn loadFailureDiagnostic() ?[]const u8 {
 
 /// Upper bound for lazily reading a single font file (64 MiB), matching the
 /// other font readers in this port.
-pub const MAX_SOURCE_BYTES: usize = 1 << 26;
+pub const MAX_SOURCE_BYTES: usize = font_blob.MAX_BYTES;
 
-/// Where a registered font's bytes come from. All memory (the byte copy or
-/// the path string) is owned by the `FontEntry`.
+/// Where a registered font's bytes come from. The entry holds one reference
+/// to the blob and owns the path string.
 pub const FontSource = union(enum) {
-    /// Eagerly registered owned bytes (`addFont`); loaded immediately.
-    bytes: []u8,
+    /// Eagerly registered bytes (`addFont`/`addFontBlob`); loaded immediately.
+    blob: *font_blob.Blob,
     /// Lazily loaded file registered by `addFontSource`; read on first use.
     path: struct {
         path: []u8,
@@ -149,9 +150,10 @@ pub const FontSource = union(enum) {
 pub const FontEntry = struct {
     id: u32,
     source: FontSource,
-    /// Owned font bytes once loaded. For `.bytes` sources this aliases
-    /// `source.bytes`; for `.path` sources it is the lazily read file.
-    blob: ?[]u8 = null,
+    /// Font bytes once loaded. For `.blob` sources this aliases
+    /// `source.blob` (one shared reference); for `.path` sources it is the
+    /// mapped file, holding its own reference.
+    blob: ?*font_blob.Blob = null,
     face: ?hb.Face = null,
     font: ?hb.Font = null,
     /// True once blob/face/font and the metric fields below are populated.
@@ -205,19 +207,6 @@ pub fn collectionIndex(index: u32) u32 {
 /// `map_glyph` / `font_metrics` calls on one backend or adapter still race the
 /// shared `hb.Buffer`, `current_weight` and entry objects, and `deinit` must
 /// not run concurrently with any query.
-/// Read a lazily registered font file. `Backend` has no `std.Io` parameter,
-/// so lazy loads go through the process-wide single-threaded I/O instance
-/// (serialized by `lazy_load_mutex`); callers that own a real `Io` can still
-/// register bytes eagerly. All I/O failures surface as
-/// `error.FontUnavailable` (OOM is preserved).
-fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        path,
-        allocator,
-        .limited(MAX_SOURCE_BYTES),
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Fallback memo (perf cache; see module header)
@@ -381,7 +370,24 @@ pub const Backend = struct {
         italic_or_oblique: bool,
         monospace_em_width: ?f32,
     ) !void {
-        const entry = try self.makeEntry(id, bytes, index, italic_or_oblique, monospace_em_width);
+        if (bytes.len == 0 or bytes.len > std.math.maxInt(c_uint)) return error.InvalidFont;
+        const blob = try font_blob.Blob.copy(self.allocator, bytes);
+        defer blob.release();
+        try self.addFontBlob(id, blob, index, italic_or_oblique, monospace_em_width);
+    }
+
+    /// `addFont` without the copy: the entry retains `blob`, so the shaper and
+    /// rasterizer can share one buffer or mapping. The caller keeps its own
+    /// reference.
+    pub fn addFontBlob(
+        self: *Backend,
+        id: u32,
+        blob: *font_blob.Blob,
+        index: u32,
+        italic_or_oblique: bool,
+        monospace_em_width: ?f32,
+    ) !void {
+        const entry = try self.makeEntry(id, blob, index, italic_or_oblique, monospace_em_width);
         try self.insertEntry(entry);
     }
 
@@ -494,8 +500,8 @@ pub const Backend = struct {
         const source = switch (entry.source) {
             // Eager sources are already loaded by `makeEntry`; recover if a
             // bytes entry was ever left unloaded instead of panicking.
-            .bytes => |bytes| {
-                entry.blob = bytes;
+            .blob => |blob| {
+                entry.blob = blob;
                 populateLoaded(entry, 0) catch |err| {
                     entry.blob = null;
                     return mapLoadError(err);
@@ -504,13 +510,11 @@ pub const Backend = struct {
             },
             .path => |p| p,
         };
-        const bytes = readSourceFile(self.allocator, source.path) catch |err| {
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.FontUnavailable;
-        };
-        entry.blob = bytes;
+        const blob = try font_blob.open(self.allocator, source.path);
+        entry.blob = blob;
         populateLoaded(entry, source.index) catch |err| {
             entry.blob = null;
-            self.allocator.free(bytes);
+            blob.release();
             return mapLoadError(err);
         };
     }
@@ -529,23 +533,23 @@ pub const Backend = struct {
     fn makeEntry(
         self: *Backend,
         id: u32,
-        bytes: []const u8,
+        blob: *font_blob.Blob,
         index: u32,
         italic_or_oblique: bool,
         monospace_em_width: ?f32,
     ) !FontEntry {
-        if (bytes.len == 0 or bytes.len > std.math.maxInt(c_uint)) return error.InvalidFont;
-        const owned = try self.allocator.dupe(u8, bytes);
-        errdefer self.allocator.free(owned);
+        _ = self;
+        if (blob.bytes.len == 0 or blob.bytes.len > std.math.maxInt(c_uint)) return error.InvalidFont;
         var entry = FontEntry{
             .id = id,
-            .source = .{ .bytes = owned },
-            .blob = owned,
+            .source = .{ .blob = blob },
+            .blob = blob,
             .monospace_width = monospace_em_width,
             .monospaced = monospace_em_width != null,
             .italic_or_oblique = italic_or_oblique,
         };
         try populateLoaded(&entry, index);
+        _ = blob.retain();
         return entry;
     }
 
@@ -555,7 +559,7 @@ pub const Backend = struct {
     /// the caller, which owns it in both `makeEntry` and `loadEntry`).
     fn populateLoaded(entry: *FontEntry, index: u32) !void {
         std.debug.assert(!entry.loaded);
-        const bytes = entry.blob orelse return error.InvalidFont;
+        const bytes = (entry.blob orelse return error.InvalidFont).bytes;
 
         // READONLY: the blob does not own or modify `bytes`; the entry frees
         // it in destroyEntry() after the face is destroyed.
@@ -630,11 +634,11 @@ pub const Backend = struct {
         if (entry.font) |*font| font.destroy();
         if (entry.face) |*face| face.destroy();
         switch (entry.source) {
-            // `entry.blob` aliases `source.bytes` for eager entries, so free
-            // the source allocation exactly once.
-            .bytes => |bytes| self.allocator.free(bytes),
+            // `entry.blob` aliases `source.blob` for eager entries: one
+            // reference, released once.
+            .blob => |blob| blob.release(),
             .path => |p| {
-                if (entry.blob) |bytes| self.allocator.free(bytes);
+                if (entry.blob) |blob| blob.release();
                 self.allocator.free(p.path);
             },
         }
@@ -671,7 +675,7 @@ pub const Backend = struct {
         for (self.entries.items) |*e| {
             if (e.id != id) continue;
             return switch (e.source) {
-                .bytes => null,
+                .blob => null,
                 .path => |p| p.path,
             };
         }
@@ -681,6 +685,15 @@ pub const Backend = struct {
     /// Registered bytes for `id` once loaded, or `null` for unknown ids and
     /// lazy entries that have not been loaded yet.
     pub fn fontBytes(self: *const Backend, id: shape_mod.FontId) ?[]const u8 {
+        for (self.entries.items) |*e| {
+            if (e.id == id) return if (e.blob) |b| b.bytes else null;
+        }
+        return null;
+    }
+
+    /// The loaded blob for `id` (borrowed; `retain` it to keep it), or `null`
+    /// for unknown ids and lazy entries that have not been loaded yet.
+    pub fn fontBlob(self: *const Backend, id: shape_mod.FontId) ?*font_blob.Blob {
         for (self.entries.items) |*e| {
             if (e.id == id) return e.blob;
         }

@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const font_blob = @import("font_blob.zig");
 const shape_hb = @import("shape_hb.zig");
 const shape_mod = @import("shape.zig");
 const font_parse = @import("font_parse.zig");
@@ -1276,6 +1277,14 @@ pub const FontSystem = struct {
     /// FreeType raster bridge.
     pub fn fontBytes(self: *const FontSystem, id: FontId) ?[]const u8 {
         if (self.shaper_backend) |*b| return b.fontBytes(id);
+        return null;
+    }
+
+    /// Loaded bytes for `id` as a shareable blob (borrowed; `retain` to keep),
+    /// or `null` for unknown ids and lazy fonts not loaded yet. Lets the
+    /// rasterizer reuse the shaper's buffer or mapping instead of copying it.
+    pub fn fontBlob(self: *const FontSystem, id: FontId) ?*font_blob.Blob {
+        if (self.shaper_backend) |*b| return b.fontBlob(id);
         return null;
     }
 
