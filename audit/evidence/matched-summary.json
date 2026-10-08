@@ -4,195 +4,195 @@
       "engine": "cozmic",
       "trial": 0,
       "workload": "small",
-      "median_ns": 12734,
+      "median_ns": 23534,
       "glyphs": 13,
       "width_sum": 58.536934,
-      "rss_kib": 9468
+      "rss_kib": 7920
     },
     {
       "engine": "cozmic",
       "trial": 0,
       "workload": "latin",
-      "median_ns": 3537624,
+      "median_ns": 3807383,
       "glyphs": 4201,
       "width_sum": 20876.428,
-      "rss_kib": 9468
+      "rss_kib": 7920
     },
     {
       "engine": "cozmic",
       "trial": 0,
       "workload": "arabic",
-      "median_ns": 1819352,
+      "median_ns": 1880954,
       "glyphs": 1334,
       "width_sum": 4934.8843,
-      "rss_kib": 9468
+      "rss_kib": 7920
     },
     {
       "engine": "cosmic-text",
       "trial": 0,
       "workload": "small",
-      "median_ns": 16792,
+      "median_ns": 16441,
       "glyphs": 13,
       "width_sum": 58.536934,
-      "rss_kib": 5412
+      "rss_kib": 5356
     },
     {
       "engine": "cosmic-text",
       "trial": 0,
       "workload": "latin",
-      "median_ns": 4310654,
+      "median_ns": 4517883,
       "glyphs": 4201,
       "width_sum": 20876.428,
-      "rss_kib": 5412
+      "rss_kib": 5356
     },
     {
       "engine": "cosmic-text",
       "trial": 0,
       "workload": "arabic",
-      "median_ns": 1846563,
+      "median_ns": 1882998,
       "glyphs": 1334,
       "width_sum": 4934.8843,
-      "rss_kib": 5412
+      "rss_kib": 5356
     },
     {
       "engine": "cozmic",
       "trial": 1,
       "workload": "small",
-      "median_ns": 12594,
+      "median_ns": 12543,
       "glyphs": 13,
       "width_sum": 58.536934,
-      "rss_kib": 9232
+      "rss_kib": 8292
     },
     {
       "engine": "cozmic",
       "trial": 1,
       "workload": "latin",
-      "median_ns": 3600352,
+      "median_ns": 3708627,
       "glyphs": 4201,
       "width_sum": 20876.428,
-      "rss_kib": 9232
+      "rss_kib": 8292
     },
     {
       "engine": "cozmic",
       "trial": 1,
       "workload": "arabic",
-      "median_ns": 1822488,
+      "median_ns": 1830289,
       "glyphs": 1334,
       "width_sum": 4934.8843,
-      "rss_kib": 9232
+      "rss_kib": 8292
     },
     {
       "engine": "cosmic-text",
       "trial": 1,
+      "workload": "small",
+      "median_ns": 16451,
+      "glyphs": 13,
+      "width_sum": 58.536934,
+      "rss_kib": 5348
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 1,
+      "workload": "latin",
+      "median_ns": 4385085,
+      "glyphs": 4201,
+      "width_sum": 20876.428,
+      "rss_kib": 5348
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 1,
+      "workload": "arabic",
+      "median_ns": 1834136,
+      "glyphs": 1334,
+      "width_sum": 4934.8843,
+      "rss_kib": 5348
+    },
+    {
+      "engine": "cozmic",
+      "trial": 2,
+      "workload": "small",
+      "median_ns": 12464,
+      "glyphs": 13,
+      "width_sum": 58.536934,
+      "rss_kib": 8412
+    },
+    {
+      "engine": "cozmic",
+      "trial": 2,
+      "workload": "latin",
+      "median_ns": 3815127,
+      "glyphs": 4201,
+      "width_sum": 20876.428,
+      "rss_kib": 8412
+    },
+    {
+      "engine": "cozmic",
+      "trial": 2,
+      "workload": "arabic",
+      "median_ns": 1869131,
+      "glyphs": 1334,
+      "width_sum": 4934.8843,
+      "rss_kib": 8412
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 2,
       "workload": "small",
       "median_ns": 16681,
       "glyphs": 13,
       "width_sum": 58.536934,
-      "rss_kib": 5412
-    },
-    {
-      "engine": "cosmic-text",
-      "trial": 1,
-      "workload": "latin",
-      "median_ns": 4309181,
-      "glyphs": 4201,
-      "width_sum": 20876.428,
-      "rss_kib": 5412
-    },
-    {
-      "engine": "cosmic-text",
-      "trial": 1,
-      "workload": "arabic",
-      "median_ns": 1831255,
-      "glyphs": 1334,
-      "width_sum": 4934.8843,
-      "rss_kib": 5412
-    },
-    {
-      "engine": "cozmic",
-      "trial": 2,
-      "workload": "small",
-      "median_ns": 12613,
-      "glyphs": 13,
-      "width_sum": 58.536934,
-      "rss_kib": 9044
-    },
-    {
-      "engine": "cozmic",
-      "trial": 2,
-      "workload": "latin",
-      "median_ns": 3559435,
-      "glyphs": 4201,
-      "width_sum": 20876.428,
-      "rss_kib": 9044
-    },
-    {
-      "engine": "cozmic",
-      "trial": 2,
-      "workload": "arabic",
-      "median_ns": 1817739,
-      "glyphs": 1334,
-      "width_sum": 4934.8843,
-      "rss_kib": 9044
-    },
-    {
-      "engine": "cosmic-text",
-      "trial": 2,
-      "workload": "small",
-      "median_ns": 16932,
-      "glyphs": 13,
-      "width_sum": 58.536934,
-      "rss_kib": 5156
+      "rss_kib": 5452
     },
     {
       "engine": "cosmic-text",
       "trial": 2,
       "workload": "latin",
-      "median_ns": 4335721,
+      "median_ns": 4392068,
       "glyphs": 4201,
       "width_sum": 20876.428,
-      "rss_kib": 5156
+      "rss_kib": 5452
     },
     {
       "engine": "cosmic-text",
       "trial": 2,
       "workload": "arabic",
-      "median_ns": 1841894,
+      "median_ns": 1814019,
       "glyphs": 1334,
       "width_sum": 4934.8843,
-      "rss_kib": 5156
+      "rss_kib": 5452
     }
   ],
   "summary": [
     {
       "workload": "small",
-      "cozmic_ns": 12613,
-      "cosmic_ns": 16792,
-      "ratio": 0.7511314911862792,
+      "cozmic_ns": 12543,
+      "cosmic_ns": 16451,
+      "ratio": 0.7624460519117379,
       "glyphs": 13,
       "width_sum": 58.536934
     },
     {
       "workload": "latin",
-      "cozmic_ns": 3559435,
-      "cosmic_ns": 4310654,
-      "ratio": 0.8257296920606478,
+      "cozmic_ns": 3807383,
+      "cosmic_ns": 4392068,
+      "ratio": 0.8668770611019684,
       "glyphs": 4201,
       "width_sum": 20876.428
     },
     {
       "workload": "arabic",
-      "cozmic_ns": 1819352,
-      "cosmic_ns": 1841894,
-      "ratio": 0.9877615107058278,
+      "cozmic_ns": 1869131,
+      "cosmic_ns": 1834136,
+      "ratio": 1.0190798283224363,
       "glyphs": 1334,
       "width_sum": 4934.8843
     }
   ],
   "binaries": {
     "cozmic": {
-      "path": ".zig-cache/o/5d9c716ae27cd5dbee93c0fbe9bc6f87/audit-matched",
-      "bytes": 6087888
+      "path": ".zig-cache/o/89a7c6749b08584a07af658ab4876cc8/audit-matched",
+      "bytes": 6115856
     },
     "cosmic-text": {
       "path": ".reference/cosmic-text/target/release/cozmic-audit",

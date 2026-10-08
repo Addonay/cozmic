@@ -1,23 +1,23 @@
 FEATURE width=73.693184
 FEATURE width=79.71591
-MATCHED small median_ns=16681 glyphs=13 width_sum=58.536934
-MATCHED latin median_ns=4309181 glyphs=4201 width_sum=20876.428
-MATCHED arabic median_ns=1831255 glyphs=1334 width_sum=4934.8843
+MATCHED small median_ns=16451 glyphs=13 width_sum=58.536934
+MATCHED latin median_ns=4385085 glyphs=4201 width_sum=20876.428
+MATCHED arabic median_ns=1834136 glyphs=1334 width_sum=4934.8843
 	Command being timed: "/home/addo/dev/stupid/cozmic/.reference/cosmic-text/target/release/cozmic-audit"
-	User time (seconds): 0.65
+	User time (seconds): 0.66
 	System time (seconds): 0.00
 	Percent of CPU this job got: 98%
-	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.66
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.68
 	Average shared text size (kbytes): 0
 	Average unshared data size (kbytes): 0
 	Average stack size (kbytes): 0
 	Average total size (kbytes): 0
-	Maximum resident set size (kbytes): 5412
+	Maximum resident set size (kbytes): 5348
 	Average resident set size (kbytes): 0
 	Major (requiring I/O) page faults: 0
-	Minor (reclaiming a frame) page faults: 583
+	Minor (reclaiming a frame) page faults: 582
 	Voluntary context switches: 1
-	Involuntary context switches: 18
+	Involuntary context switches: 104
 	Swaps: 0
 	File system inputs: 0
 	File system outputs: 0
