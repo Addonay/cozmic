@@ -3,7 +3,7 @@
 //! file under `.reference/cosmic-text/tests/`.
 
 test {
-    _ = @import("audit_regressions.zig");
+    _ = @import("regressions.zig");
     _ = @import("direction.zig");
     _ = @import("ellipsize_rendering.zig");
     _ = @import("richtext_layout.zig");

@@ -37,9 +37,7 @@ system: HarfBuzz and FreeType are loaded at runtime (no build-time link), the
 full UCD comes from a pinned ezi-code dependency, fonts register lazily from
 fontconfig or platform directories, and the upstream suites (direction, wrap
 stability, ellipsize/decorations/shaping images, variable weights) run in
-`zig build test`. The remaining gaps and the "safe as the only text stack"
-gates (ZUI element wiring, IME, packaging) are tracked in
-[plan.md](plan.md).
+`zig build test`. Remaining gaps are listed below.
 
 The `.reference/` checkouts (`cosmic-text`, `ezi-code`, HarfBuzz/FreeType
 sources) are only needed for regeneration/diffing; the library builds from
@@ -67,11 +65,13 @@ sources) are only needed for regeneration/diffing; the library builds from
 
 ## Building
 
+Requires Zig 0.17.0 or newer.
+
 ```sh
 zig build test           # all tests (module + ported upstream suites)
-zig build audit          # the COZMIC_AUDIT.md regression assertions only
 zig build check-bindings # verify generated runtime bindings are in date
 zig build bench          # cozmic benchmarks (-- --quick for a smoke run)
+zig build bench-matched  # like-for-like run against benches/upstream/matched_probe.rs
 zig build bench-compare  # cozmic vs cosmic-text criterion side-by-side
 zig build run            # shape one line and print its metrics
 ```
@@ -82,45 +82,6 @@ their `*_enabled` constants separately report editor readiness.
 
 ## Benchmarks
 
-The benches under `benches/` load only the vendored corpus in `tests/fonts`
-(Inter, Noto Sans Arabic, Noto Sans Hebrew, FiraMono) with explicit family
-names; they never touch system fonts, so every row is reproducible. They are
-compiled at `-Dbench-optimize` (default `ReleaseFast`) independently of
-`-Doptimize`, which still controls the app and tests.
-
-```sh
-zig build bench                      # full run, human-readable
-zig build bench -- --quick           # smoke run: iters=3 warmup=1
-COZMIC_BENCH_QUICK=1 zig build bench # same via environment
-zig build bench -- --format json     # one JSON row per line
-zig build bench -- --iter 10 --warmup 2
-```
-
-`tools/bench_compare.py` joins the JSON rows with the cosmic-text criterion
-results; see `zig build bench-compare -- --help` (`--quick`, `--no-rust`,
-`--iters`, `--measurement-time`, `--zig-bin`). The `loadFontSystem` row
-measures an empty `FontSystem` plus a `tests/fonts` directory load; upstream's
-`FontSystem::new()` scans the host font set, so that row is not directly
-comparable across hosts.
-
-### Bench semantics: parity rows vs warm run-cache rows
-
-Standard rows **disable** the shaped-run cache so they compare like-for-like
-with cosmic-text, whose equivalent `shape-run-cache` feature is default-off.
-Rows suffixed `(run-cache warm)` enable it: the warmup pass fills the cache
-and the timed iterations measure steady state — what an editor or frame loop
-pays after the first render. The cache is **enabled by default for library
-consumers**: it lives on the shaper backend (as upstream's does on
-`FontSystem`), persists across buffers and frames, and lets the advanced path
-skip shaping whenever the same run recurs — hits reproduce every glyph field
-(byte-for-byte equal to fresh shaping, enforced by the image/wrap suites).
-
-A cache key covers the run text, the shaping direction, the default attrs and
-every non-default span (which includes `font_features`, `color_opt` and
-`letter_spacing_opt`), so different features or directions never share an
-entry. The cache is bounded by **both** a 16,384-entry cap and a 64 MiB
-retained-byte budget, enforced by LRU eviction after every insert; font
-registration and raster-producer changes clear it, since cached glyph ids and
-pixel data belong to the face that produced them.
-`FontSystem.setRunCacheEnabled` / `clearRunCache` let tools flip semantics.
-
+On matched cold-layout workloads with identical glyph output, cozmic runs
+0.76x–1.02x of cosmic-text's time. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+for methodology, the run-cache semantics, and binary-size figures.

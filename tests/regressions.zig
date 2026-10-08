@@ -1,4 +1,4 @@
-//! Regression tests for the eight defects reported in `COZMIC_AUDIT.md`
+//! Regression tests for defects found in the 2026-10 cosmic-text parity audit
 //! (audit date 2026-10-03, findings 1-8).
 //!
 //! The audit shipped `tests/audit_findings.zig` as *diagnostic witnesses* that

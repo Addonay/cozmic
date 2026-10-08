@@ -1668,7 +1668,7 @@ fn floatToI32Saturating(v: f32) i32 {
 //
 // Real-font policy: tests register the vendored faces under `tests/fonts`
 // via the real `FontDb.addFace` + `FontSystem.initWithDb` APIs (there is no
-// `loadFontData`/`loadFontsDir` yet -- see plan.md). `TestFontSystem.init`
+// `loadFontData`/`loadFontsDir` yet). `TestFontSystem.init`
 // skips (`error.SkipZigTest`) only when a vendored font is genuinely absent.
 
 const testing = std.testing;
