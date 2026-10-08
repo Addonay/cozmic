@@ -1,0 +1,216 @@
+ Downloading crates ...
+  Downloaded rustc_version v0.2.3
+  Downloaded semver-parser v0.7.0
+  Downloaded semver v0.9.0
+  Downloaded derivative v2.2.0
+  Downloaded modit v0.1.5
+  Downloaded cosmic_undo_2 v0.2.0
+   Compiling memchr v2.8.3
+   Compiling semver-parser v0.7.0
+   Compiling once_cell v1.21.4
+   Compiling pkg-config v0.3.34
+   Compiling syn v1.0.109
+   Compiling regex-syntax v0.8.11
+   Compiling powerfmt v0.2.0
+   Compiling time-core v0.1.9
+   Compiling deranged v0.5.8
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling num-conv v0.2.2
+   Compiling thiserror v2.0.20
+   Compiling semver v0.9.0
+   Compiling read-fonts v0.41.0
+   Compiling thiserror-impl v2.0.20
+   Compiling base64 v0.23.1
+   Compiling linked-hash-map v0.5.6
+   Compiling rustc_version v0.2.3
+   Compiling yaml-rust v0.4.5
+   Compiling bincode v1.3.3
+   Compiling onig_sys v69.9.3
+   Compiling serde_json v1.0.151
+   Compiling indexmap v2.14.2
+   Compiling time v0.3.55
+   Compiling cosmic_undo_2 v0.2.0
+   Compiling quick-xml v0.42.0
+   Compiling fnv v1.0.7
+   Compiling tinytemplate v1.2.1
+   Compiling modit v0.1.5
+   Compiling regex-automata v0.4.18
+   Compiling derivative v2.2.0
+   Compiling plist v1.10.1
+   Compiling regex v1.13.1
+   Compiling criterion v0.8.2
+   Compiling skrifa v0.44.0
+   Compiling swash v0.2.10
+   Compiling onig v6.5.3
+   Compiling syntect v5.3.0
+   Compiling cosmic-text v0.19.0 (/home/addo/dev/stupid/cozmic/.reference/cosmic-text)
+warning: unused import: `std::path::PathBuf`
+ --> tests/ellipsize_rendering.rs:1:5
+  |
+1 | use std::path::PathBuf;
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `Buffer`, `FontSystem`, `Metrics`, `Shaping`, and `fontdb::Database`
+ --> tests/ellipsize_rendering.rs:5:5
+  |
+5 |     fontdb::Database, Align, Attrs, Buffer, Ellipsize, EllipsizeHeightLimit, Family, FontSystem,
+  |     ^^^^^^^^^^^^^^^^                ^^^^^^                                           ^^^^^^^^^^
+6 |     Metrics, Shaping, Wrap,
+  |     ^^^^^^^  ^^^^^^^
+
+warning: methods `rich_text`, `wrap`, `ellipsize`, and `alignment` are never used
+   --> tests/common/mod.rs:72:12
+    |
+ 59 | impl DrawTestCfg {
+    | ---------------- methods in this implementation
+...
+ 72 |     pub fn rich_text(
+    |            ^^^^^^^^^
+...
+102 |     pub fn wrap(mut self, wrap: Wrap) -> Self {
+    |            ^^^^
+...
+107 |     pub fn ellipsize(mut self, ellipsize: Ellipsize) -> Self {
+    |            ^^^^^^^^^
+...
+112 |     pub fn alignment(mut self, alignment: Option<Align>) -> Self {
+    |            ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `text`, `wrap`, `ellipsize`, and `alignment` are never used
+   --> tests/common/mod.rs:67:12
+    |
+ 59 | impl DrawTestCfg {
+    | ---------------- methods in this implementation
+...
+ 67 |     pub fn text(mut self, text: impl Into<String>) -> Self {
+    |            ^^^^
+...
+102 |     pub fn wrap(mut self, wrap: Wrap) -> Self {
+    |            ^^^^
+...
+107 |     pub fn ellipsize(mut self, ellipsize: Ellipsize) -> Self {
+    |            ^^^^^^^^^
+...
+112 |     pub fn alignment(mut self, alignment: Option<Align>) -> Self {
+    |            ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `cosmic-text` (test "shaping_and_rendering") generated 1 warning
+warning: `cosmic-text` (test "ellipsize_rendering") generated 2 warnings (run `cargo fix --test "ellipsize_rendering" -p cosmic-text` to apply 2 suggestions)
+warning: `cosmic-text` (test "text_decorations") generated 1 warning
+    Finished `test` profile [optimized + debuginfo] target(s) in 49.46s
+     Running unittests src/lib.rs (target/debug/deps/cosmic_text-9b717fc78911a609)
+
+running 4 tests
+test glyph_cache::test_subpixel_bins ... ok
+test line_ending::test_line_iter ... ok
+test swash::test::no_coord_leakage_across_fonts ... ok
+test font::test::test_fonts_load_time ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/direction.rs (target/debug/deps/direction-ca41cc8052a72861)
+
+running 7 tests
+test forced_rtl_overrides_ltr_content ... ok
+test forced_ltr_keeps_rtl_glyphs ... ok
+test force_ltr_overrides_first_strong_rtl ... ok
+test forced_ltr_overrides_rtl_content ... ok
+test force_ltr_overrides_weak ... ok
+test auto_detects_per_paragraph ... ok
+test changing_direction_reshapes_cached_lines ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/editor_modified_state.rs (target/debug/deps/editor_modified_state-fd6331294b40e8ff)
+
+running 7 tests
+test insert_in_empty_editor_sets_changed ... ok
+test redoing_past_save_point_sets_editor_to_changed ... ok
+test insert_and_undo_in_unsaved_editor_is_unchanged ... ok
+test undo_to_save_point_sets_editor_to_unchanged ... ok
+test undoing_past_save_point_sets_editor_to_changed ... ok
+test redoing_to_save_point_sets_editor_as_unchanged ... ok
+test editor_line_endings_preserved ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ellipsize_rendering.rs (target/debug/deps/ellipsize_rendering-e884e9441496d5e3)
+
+running 14 tests
+test test_ellipsize_ltr_middle_small_buffer ... ok
+test test_ellipsize_ltr_end_single_line ... ok
+test test_ellipsize_ltr_middle_single_line ... ok
+test test_ellipsize_mixed_middle_single_line ... ok
+test test_ellipsize_mixed_end_single_line ... ok
+test test_ellipsize_ltr_start_single_line ... ok
+test test_ellipsize_bidi_isolates_middle_bug ... ok
+test test_ellipsize_ltr_end_single_line_aligned_right ... ok
+test test_ellipsize_mixed_ltr_rtl_middle_two_lines ... ok
+test test_ellipsize_ltr_single_word_middle_two_lines ... ok
+test test_ellipsize_ltr_end_two_lines ... ok
+test test_ellipsize_rtl_end_single_line ... ok
+test test_ellipsize_mixed_ltr_rtl_ltr_middle_three_lines ... ok
+test test_ellipsize_mixed_rtl_ltr_middle_two_lines ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/richtext_layout.rs (target/debug/deps/richtext_layout-5a98e018751f306d)
+
+running 1 test
+test empty_lines_use_span_metrics ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/shaping_and_rendering.rs (target/debug/deps/shaping_and_rendering-e21f621ea9293ea7)
+
+running 8 tests
+test test_ligature_segmentation ... ok
+test test_mixed_direction_paragraphs_do_not_panic ... ok
+test test_hebrew_word_rendering ... ok
+test test_arabic_word_rendering ... ok
+test test_english_mixed_with_arabic_paragraph_rendering ... ok
+test test_hebrew_paragraph_rendering ... ok
+test test_arabic_paragraph_rendering ... ok
+test test_english_mixed_with_hebrew_paragraph_rendering ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/text_decorations.rs (target/debug/deps/text_decorations-6d3460329a6ee9a6)
+
+running 4 tests
+test test_text_decorations ... ok
+test test_text_decorations_bidi ... ok
+test test_text_decorations_rtl ... ok
+test test_text_decorations_multiline_bidi ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/variable_font_weight.rs (target/debug/deps/variable_font_weight-57603abb893ca6f3)
+
+running 1 test
+test variable_font_all_weights_match ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/wrap_stability.rs (target/debug/deps/wrap_stability-f2ba451ed8a775a0)
+
+running 2 tests
+test wrap_extra_line ... ok
+test stable_wrap ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.33s
+
+     Running tests/wrap_word_fallback.rs (target/debug/deps/wrap_word_fallback-ad143889c391abc4)
+
+running 1 test
+test wrap_word_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

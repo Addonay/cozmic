@@ -91,6 +91,26 @@ pub const FontId = layout.FontId;
 pub const CursorPosition = buffer.CursorPosition;
 pub const SwashCache = swash_cache.SwashCache;
 pub const Raster = font_raster.Raster;
+
+/// Backend load diagnostics.
+///
+/// The native libraries are loaded through `dynload`, which caches its result
+/// process-wide: a failure repeats the same bare error with no explanation.
+/// These report the loaded version and, when loading failed, a message naming
+/// what was wanted. Both return "not usable" rather than claiming success when
+/// the version cannot be read.
+pub const backendVersion = struct {
+    /// HarfBuzz version string, `""` when the library cannot be loaded.
+    pub const harfbuzz = shape_hb.version;
+    /// Whether the loaded HarfBuzz satisfies `shape_hb.MINIMUM_VERSION`.
+    pub const harfbuzzMeetsMinimum = shape_hb.meetsMinimumVersion;
+    /// Message for a failed HarfBuzz load/bind, `null` when it loaded.
+    pub const harfbuzzFailure = shape_hb.loadFailureDiagnostic;
+    /// Whether the loaded FreeType satisfies `font_raster.MINIMUM_VERSION`.
+    pub const freetypeMeetsMinimum = font_raster.meetsMinimumVersion;
+    /// Message for a failed FreeType load/bind, `null` when it loaded.
+    pub const freetypeFailure = font_raster.loadFailureDiagnostic;
+};
 pub const LineEnding = line_ending.LineEnding;
 pub const LineIter = line_ending.LineIter;
 pub const Wrap = layout.Wrap;
@@ -132,19 +152,7 @@ test {
     _ = @import("shape_hb.zig");
 }
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
-
-/// Deprecated template boilerplate. Kept until benches stop using it;
-/// do not use in new code (use real `cozmic.buffer` / `cozmic.attrs` APIs).
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
-}
+// The `zig init` template helpers (`printAnotherMessage`, `add`) and the
+// template executable in `src/main.zig` were removed: the audit flagged them
+// as boilerplate that reads like public API but exercises none of the engine.
+// Examples for this library should drive `cozmic.Buffer` / `cozmic.FontSystem`.

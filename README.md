@@ -45,13 +45,35 @@ The `.reference/` checkouts (`cosmic-text`, `ezi-code`, HarfBuzz/FreeType
 sources) are only needed for regeneration/diffing; the library builds from
 `build.zig.zon` (ezi-code URL+hash) without them.
 
+### Known gaps
+
+- The `cozmic.vi` and `cozmic.syntect` surfaces are experimental and off by
+  default (`-Dvi` / `-Dsyntect`). They are local models, not ports of upstream's
+  ViEditor/SyntaxEditor, so do not treat them as parity with cosmic-text's
+  optional features. Their `*_enabled` constants report readiness honestly.
+- System variable fonts registered through fontconfig have no `wght` axis range
+  (the directory/byte parsing paths do parse `fvar`), so they only match at
+  their nominal weight.
+- `FontSystem.getFont` is an id/weight lookup, not a `fontdb`-equivalent font
+  object. Shaping goes through `FontSystem.shaper()` and rasterization through
+  `font_raster.Raster`; both resolve and own the face bytes themselves.
+- The run cache's eviction is a linear scan per eviction (correct and bounded,
+  but not optimized for very large cold documents). See
+  `ShapeRunCache.enforceBudget`.
+- Deployment still requires loadable HarfBuzz and FreeType shared libraries at
+  runtime. `cozmic.backendVersion` reports the loaded versions and a
+  human-readable reason when a load fails, instead of only a cached error.
+- Only Linux is validated by CI. Windows/macOS branches exist but are untested.
+
 ## Building
 
 ```sh
 zig build test           # all tests (module + ported upstream suites)
+zig build audit          # the COZMIC_AUDIT.md regression assertions only
 zig build check-bindings # verify generated runtime bindings are in date
 zig build bench          # cozmic benchmarks (-- --quick for a smoke run)
 zig build bench-compare  # cozmic vs cosmic-text criterion side-by-side
+zig build run            # shape one line and print its metrics
 ```
 
 Optional features: `-Dvi`, `-Dsyntect` (default off). These gate whether the
@@ -89,9 +111,16 @@ Rows suffixed `(run-cache warm)` enable it: the warmup pass fills the cache
 and the timed iterations measure steady state — what an editor or frame loop
 pays after the first render. The cache is **enabled by default for library
 consumers**: it lives on the shaper backend (as upstream's does on
-`FontSystem`), persists across buffers and frames, is bounded to the16k most
-recently used runs, and lets the advanced path skip shaping whenever the same
-`(run text, attrs)` recurs — hits reproduce every glyph field (byte-for-byte
-equal to fresh shaping, enforced by the image/wrap suites).
+`FontSystem`), persists across buffers and frames, and lets the advanced path
+skip shaping whenever the same run recurs — hits reproduce every glyph field
+(byte-for-byte equal to fresh shaping, enforced by the image/wrap suites).
+
+A cache key covers the run text, the shaping direction, the default attrs and
+every non-default span (which includes `font_features`, `color_opt` and
+`letter_spacing_opt`), so different features or directions never share an
+entry. The cache is bounded by **both** a 16,384-entry cap and a 64 MiB
+retained-byte budget, enforced by LRU eviction after every insert; font
+registration and raster-producer changes clear it, since cached glyph ids and
+pixel data belong to the face that produced them.
 `FontSystem.setRunCacheEnabled` / `clearRunCache` let tools flip semantics.
 

@@ -232,7 +232,7 @@ test "e2e: FreeType raster produces coverage for shaped glyphs" {
 
     const Vis = struct {
         count: usize = 0,
-        fn visit(ctx: *anyopaque, x: i32, y: i32, color: u32) void {
+        fn visit(ctx: *anyopaque, x: i32, y: i32, color: attrs_mod.Color) void {
             _ = x;
             _ = y;
             _ = color;

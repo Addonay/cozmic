@@ -13,13 +13,13 @@
 //!
 //! Section map to `shape.rs` (verbatim ports are marked with line refs):
 //! - `Shaping`, `Direction` ........................... shape.rs:26-106
-//! - `ShapeBuffer` (plan cache FIFO cap 6) ............ shape.rs:108-141
+//! - `ShapeBuffer` (scratch sets) ..................... shape.rs:108-141
 //! - HarfBuzz path (`shape_fallback`, `shape_run`) .... shape.rs:143-438
-//!   via the narrow `ShapeAdapter` vtable + pure-Zig `CharmapAdapter`.
-//!   WIRING POINT (`hb_shape_plan_execute`): replace `CharmapAdapter.shapeRun`
-//!   with `harfrust` plan lookup + `shape_with_plan`; the surrounding logic
-//!   (tab rewrite, plan-cache FIFO, missing-glyph splice, end adjustment,
-//!   script collection) is already verbatim.
+//!   via the narrow `ShapeAdapter` vtable. The production implementation is
+//!   `shape_hb.Backend` (runtime-loaded HarfBuzz); `CharmapAdapter` is a
+//!   pure-Zig stand-in for tests and for hosts without the library. The
+//!   surrounding logic (tab rewrite, missing-glyph splice, end adjustment,
+//!   script collection, effective-feature pass-through) is verbatim.
 //! - Fallback memoization: the optional `ShapeAdapter.VTable.note_fallback`
 //!   hook reports each fallback attempt's coverage after the splice; it
 //!   defaults to a no-op, so adapters and tests without a cache need no
@@ -91,6 +91,8 @@ pub const GlyphDecorationData = attrs_mod.GlyphDecorationData;
 pub const Attrs = attrs_mod.Attrs;
 pub const AttrsList = attrs_mod.AttrsList;
 pub const Span = attrs_mod.Span;
+pub const Feature = attrs_mod.Feature;
+pub const FeatureTag = attrs_mod.FeatureTag;
 
 pub const BidiClass = unicode.BidiClass;
 pub const Script = unicode.Script;
@@ -252,41 +254,6 @@ pub const Direction = enum {
 // ShapeBuffer scratch (shape.rs:108-141)
 // ---------------------------------------------------------------------------
 
-pub const NUM_SHAPE_PLANS: usize = 6;
-
-const PlanEntry = struct {
-    font_id: FontId,
-    script: Script,
-    rtl: bool,
-};
-
-/// FIFO plan cache: up to `NUM_SHAPE_PLANS` plans; inserting past capacity
-/// evicts the least recently *added* (shape.rs:113-115, 209-220).
-pub const PlanCache = struct {
-    entries: [NUM_SHAPE_PLANS]PlanEntry = undefined,
-    len: usize = 0,
-
-    pub fn find(self: *const PlanCache, font_id: FontId, script: Script, rtl: bool) ?usize {
-        for (self.entries[0..self.len], 0..) |e, i| {
-            if (e.font_id == font_id and e.script == script and e.rtl == rtl) return i;
-        }
-        return null;
-    }
-
-    /// Returns the plan index, evicting the front entry when full.
-    pub fn getOrPut(self: *PlanCache, font_id: FontId, script: Script, rtl: bool) usize {
-        if (self.find(font_id, script, rtl)) |i| return i;
-        if (self.len >= NUM_SHAPE_PLANS) {
-            // pop_front (shape.rs:211-213).
-            std.mem.copyForwards(PlanEntry, self.entries[0 .. NUM_SHAPE_PLANS - 1], self.entries[1..NUM_SHAPE_PLANS]);
-            self.len = NUM_SHAPE_PLANS - 1;
-        }
-        self.entries[self.len] = .{ .font_id = font_id, .script = script, .rtl = rtl };
-        self.len += 1;
-        return self.len - 1;
-    }
-};
-
 pub const VisualLine = struct {
     ranges: std.ArrayList(VlRange) = .empty,
     spaces: u32 = 0,
@@ -318,7 +285,6 @@ pub const VisualLine = struct {
 /// slice-based word payload design (TODO(shape): revisit with an arena paged
 /// store).
 pub const ShapeBuffer = struct {
-    plans: PlanCache = .{},
     scripts: std.ArrayList(Script) = .empty,
     span_pool: std.ArrayList(ShapeSpan) = .empty,
     word_pool: std.ArrayList(ShapeWord) = .empty,
@@ -436,10 +402,13 @@ pub fn fontQueryFor(a: *const attrs_mod.AttrsOwned) FontQuery {
     };
 }
 
-/// WIRING POINT (`hb_shape_plan_execute`): implement this vtable with a real
-/// HarfBuzz backend; `shapeFallback`/`shapeRun` below already implement the
-/// exact surrounding logic (plan-cache FIFO, tab rewrite, missing collection,
-/// end adjustment, fallback splice).
+/// Narrow shaping seam.
+///
+/// `shape_hb.Backend` is the production implementation (real HarfBuzz loaded at
+/// runtime through `dynload`); `CharmapAdapter` below is a pure-Zig stand-in
+/// used by tests and by hosts without the library. `shapeFallback`/`shapeRun`
+/// implement the surrounding logic exactly (tab rewrite, feature pass-through,
+/// missing collection, end adjustment, fallback splice).
 /// Re-export: the age-stamped shaped-run cache consulted by the advanced
 /// path through the adapter seam (`ShapeAdapter.runCache`).
 pub const ShapeRunCache = @import("shape_run_cache.zig").ShapeRunCache;
@@ -450,13 +419,20 @@ pub const ShapeAdapter = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Shape `text` (already tab-rewritten by the caller) with `font`.
+        /// Shape `text` with `font`, applying `features` (the run's effective
+        /// `attrs.font_features`, in order) over the whole run. The slice is
+        /// borrowed for the duration of the call and may be empty for the
+        /// default font behavior; backends that cannot express features must
+        /// still receive them here (upstream `shape_fallback` builds
+        /// `rb_font_features` from the run-start span and shapes with them,
+        /// shape.rs:181-215).
         shape_run: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             font: FontId,
             text: []const u8,
             rtl: bool,
+            features: []const Feature,
         ) ShapeError![]ShapedRunGlyph,
         map_glyph: *const fn (ptr: *anyopaque, font: FontId, cp: u21) u16,
         advance_em: *const fn (ptr: *anyopaque, font: FontId, glyph_id: u16) f32,
@@ -505,8 +481,8 @@ pub const ShapeAdapter = struct {
         ) void = null,
     };
 
-    pub fn shapeRun(self: ShapeAdapter, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool) ShapeError![]ShapedRunGlyph {
-        return self.vtable.shape_run(self.ptr, alloc, font, text, rtl);
+    pub fn shapeRun(self: ShapeAdapter, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool, features: []const Feature) ShapeError![]ShapedRunGlyph {
+        return self.vtable.shape_run(self.ptr, alloc, font, text, rtl, features);
     }
     pub fn mapGlyph(self: ShapeAdapter, font: FontId, cp: u21) u16 {
         return self.vtable.map_glyph(self.ptr, font, cp);
@@ -699,7 +675,8 @@ pub const CharmapAdapter = struct {
         };
     }
 
-    fn charmapShapeRun(ptr: *anyopaque, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool) ShapeError![]ShapedRunGlyph {
+    fn charmapShapeRun(ptr: *anyopaque, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool, features: []const Feature) ShapeError![]ShapedRunGlyph {
+        _ = features; // No GSUB/GPOS: the stand-in has no feature support.
         const self: *CharmapAdapter = @ptrCast(@alignCast(ptr));
         self.runs_shaped += 1;
         var out: std.ArrayList(ShapedRunGlyph) = .empty;
@@ -730,6 +707,21 @@ pub const CharmapAdapter = struct {
 // shape_fallback (shape.rs:143-296) — adapter path
 // ---------------------------------------------------------------------------
 
+/// Replace every `'\t'` in `run` with `' '` for shaping (shape.rs:165-173).
+///
+/// Byte-length preserving, so returned cluster offsets still index the
+/// caller's original `line`. The common tab-free case borrows `run` and
+/// performs no allocation; the caller owns the returned slice either way and
+/// must free it with `alloc`.
+pub fn rewriteTabs(alloc: std.mem.Allocator, run: []const u8) std.mem.Allocator.Error![]u8 {
+    if (std.mem.indexOfScalar(u8, run, '\t') == null) return alloc.dupe(u8, run);
+    const copy = try alloc.dupe(u8, run);
+    for (copy) |*byte| {
+        if (byte.* == '\t') byte.* = ' ';
+    }
+    return copy;
+}
+
 pub const FallbackResult = struct {
     glyphs: []ShapeGlyph,
     missing: []usize,
@@ -740,18 +732,17 @@ pub const FallbackResult = struct {
     }
 };
 
-/// Shape one font run (shape.rs:143-296). Tab rewrite, plan-cache FIFO touch,
-/// per-glyph attrs (`letter_spacing`, color, fake-italic…), missing collection
-/// and LTR/RTL end adjustment are verbatim; the HarfBuzz core
-/// (`UnicodeBuffer` + `ShapePlan` + `shape_with_plan`) is the
-/// `ShapeAdapter.shapeRun` call below (see module WIRING POINT).
-/// NOTE: `buffer.guess_segment_properties()` + `assert_eq!(rtl, span_rtl)`
-/// (shape.rs:174-177) live in the backend; the adapter contract requires the
-/// caller to pass the span's `rtl` consistently.
+/// Shape one font run (shape.rs:143-296). Tab rewrite, per-glyph attrs
+/// (`letter_spacing`, color, fake-italic…), missing collection and LTR/RTL end
+/// adjustment are verbatim; shaping itself, including the effective feature
+/// set and the backend's plan handling, is the `ShapeAdapter.shapeRun` call
+/// below.
+/// NOTE: `buffer.guess_segment_properties()` (shape.rs:174-177) lives in the
+/// backend; the adapter contract requires the caller to pass the span's `rtl`
+/// consistently.
 pub fn shapeFallback(
     alloc: std.mem.Allocator,
     adapter: ShapeAdapter,
-    buf: *ShapeBuffer,
     font: FontId,
     line: []const u8,
     attrs: *const AttrsList,
@@ -762,16 +753,25 @@ pub fn shapeFallback(
     const run = line[start_run..end_run];
     const fm = adapter.fontMetrics(font);
 
-    // Touch the plan cache (shape.rs:197-221): keyed by font + script +
-    // direction here (features/instance/language fold into the backend).
-    const script: Script = scriptOf(if (run.len > 0) decodeOne(run, 0).cp else ' ');
-    _ = buf.plans.getOrPut(font, script, span_rtl);
+    // Shape plans are the backend's business: `ShapeAdapter.shapeRun` hands it
+    // the font, direction, script (via the buffer's guessed segment properties)
+    // and the run's features, which together form upstream's `ShapePlanKey`
+    // (shape.rs:190-215). This port used to keep a local six-entry FIFO keyed
+    // by font/script/direction only and then discarded the returned index
+    // without ever shaping through a plan, so it was pure bookkeeping that
+    // looked like a cache. The HarfBuzz adapter calls `hb_shape`, which
+    // resolves and caches a plan internally. Reintroducing a real plan cache
+    // would need `hb_shape_plan_create_cached` plus the full key (features and
+    // language included); that is only worth doing against a measurement, and
+    // the shaped-run cache already removes repeated work per run.
 
     // Tabs are shaped as spaces (shape.rs:165-173). Clusters still refer to
-    // the original bytes; the rewrite is backend-local. Our charmap backend
-    // already maps '\t' like a space, so no copy is needed; a real HarfBuzz
-    // backend must push the rewritten string (see WIRING POINT).
-    const shaped = try adapter.shapeRun(alloc, font, run, span_rtl);
+    // the original bytes: a tab and a space are both one byte, so cluster
+    // offsets and attrs spans stay valid. The rewrite is byte-length
+    // preserving, which is why the run is never re-sliced for attrs.
+    const tabless = try rewriteTabs(alloc, run);
+    defer alloc.free(tabless);
+    const shaped = try adapter.shapeRun(alloc, font, tabless, span_rtl, attrs.get_span(start_run).font_features.features.items);
     defer alloc.free(shaped);
 
     var glyphs: std.ArrayList(ShapeGlyph) = .empty;
@@ -949,7 +949,7 @@ pub fn shapeRun(
     var primary_retried = false;
     const glyph_start = out.items.len;
     const first = while (true) {
-        const res = shapeFallback(alloc, adapter, buf, primary, line, attrs, start_run, end_run, span_rtl) catch |err| {
+        const res = shapeFallback(alloc, adapter, primary, line, attrs, start_run, end_run, span_rtl) catch |err| {
             if (err != error.FontUnavailable or primary_retried) return err;
             primary_retried = true;
             const alt = adapter.fontFor(query) orelse return err;
@@ -977,7 +977,7 @@ pub fn shapeRun(
         // An unloadable fallback candidate is skipped, not fatal: the
         // attempt counter already moved on, so the next candidate is tried.
         // Only OOM (and other run errors) abort the run.
-        const fb_res = shapeFallback(alloc, adapter, buf, fb, line, attrs, start_run, end_run, span_rtl) catch |err| {
+        const fb_res = shapeFallback(alloc, adapter, fb, line, attrs, start_run, end_run, span_rtl) catch |err| {
             if (err == error.FontUnavailable) continue;
             return err;
         };
@@ -1136,14 +1136,26 @@ pub fn shapeSkipGlyphs(
     return glyphs.toOwnedSlice(alloc);
 }
 
-/// Bounds for the advanced-path run cache. Entries hold owned run text,
-/// cloned attrs and a glyph vector, so the cap must comfortably fit a real
-/// document's unique word-runs — hello/moby carry2-8k of them. Past the cap
-/// the cache trims to the most recently used half (entries are age-stamped by
-/// both `get` and `insert`, so hot runs refresh and survive); upstream's
-/// ShapeRunCache is unbounded, this keeps worst-case memory in check without
-/// evicting a working set. ~16k entries ≈ single-digit MB worst case.
+/// Entry-count budget for the advanced-path run cache.
+///
+/// Entries hold owned run text, cloned attrs and a glyph vector, so the cap has
+/// to comfortably fit a real document's unique word-runs (hello/moby carry
+/// 2-8k of them) while still bounding memory. Enforced by
+/// `ShapeRunCache.enforceBudget`, which evicts by recency of use. The previous
+/// `trim(run_cache_max / 2)` call could not enforce this: `trim` treats its
+/// argument as an age window, so during a first burst every entry had age zero
+/// and all of them survived.
 const run_cache_max: usize = 16384;
+
+/// Byte budget for the advanced-path run cache, enforced alongside
+/// `run_cache_max`.
+///
+/// The count bound alone does not bound memory: one entry's cost scales with
+/// its run length and glyph count, so a document of long unique runs reaches an
+/// arbitrarily large working set while staying under 16,384 entries. This
+/// budget covers retained key text, cloned attrs and glyph vectors. It is a
+/// ceiling on live bytes, not a preallocation.
+const run_cache_max_bytes: usize = 64 * 1024 * 1024;
 
 /// Advanced-path shaped-run cache (upstream `shape_run_cached`, behind the
 /// default-off `shape-run-cache` feature; always available here, opt-in per
@@ -1210,6 +1222,9 @@ pub fn shapeRunCached(
         .text = line[start_run..end_run],
         .default_attrs = &attrs.default_attrs,
         .spans = spans,
+        // Direction is a shaping input, not an incidental: RTL runs come back
+        // with reversed glyph order and descending clusters.
+        .rtl = span_rtl,
     };
 
     if (cache.get(&key)) |glyphs| {
@@ -1233,7 +1248,10 @@ pub fn shapeRunCached(
     try out.appendSlice(alloc, shaped.items);
     try rebaseGlyphs(shaped.items, -@as(isize, @intCast(start_run)));
     try cache.insert(&key, shaped.items);
-    if (cache.len() >= run_cache_max) cache.trim(run_cache_max / 2);
+    // Enforce both budgets. `trim` cannot do this: during a cold burst every
+    // entry shares one age, so an age window retains them all and the entry cap
+    // goes unenforced.
+    cache.enforceBudget();
 }
 
 /// Basic shaping without fallback, plus the SansSerif/Monospace repatch for
@@ -3741,10 +3759,10 @@ test "shapeRun retries the primary once when its first load fails" {
     const Flaky = struct {
         var font_for_calls: usize = 0;
         var shape_calls: usize = 0;
-        fn shapeRun(ptr: *anyopaque, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool) ShapeError![]ShapedRunGlyph {
+        fn shapeRun(ptr: *anyopaque, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool, features: []const Feature) ShapeError![]ShapedRunGlyph {
             shape_calls += 1;
             if (font == PRIMARY_FONT_ID) return error.FontUnavailable;
-            return CharmapAdapter.charmapShapeRun(ptr, alloc, font, text, rtl);
+            return CharmapAdapter.charmapShapeRun(ptr, alloc, font, text, rtl, features);
         }
         fn fontFor(ptr: *anyopaque, query: FontQuery) ?FontId {
             _ = ptr;
@@ -3783,12 +3801,13 @@ test "shapeRun returns the primary error when no alternative exists" {
     var charmap = CharmapAdapter{};
     const NoAlt = struct {
         var shape_calls: usize = 0;
-        fn shapeRun(ptr: *anyopaque, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool) ShapeError![]ShapedRunGlyph {
+        fn shapeRun(ptr: *anyopaque, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool, features: []const Feature) ShapeError![]ShapedRunGlyph {
             _ = ptr;
             _ = alloc;
             _ = font;
             _ = text;
             _ = rtl;
+            _ = features;
             shape_calls += 1;
             return error.FontUnavailable;
         }
@@ -3824,10 +3843,10 @@ test "shapeRun skips a FontUnavailable fallback and reaches the next" {
     var charmap = CharmapAdapter{ .primary_missing = &[_]u21{'世'} };
     const FlakyFallback = struct {
         var shape_calls: usize = 0;
-        fn shapeRun(ptr: *anyopaque, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool) ShapeError![]ShapedRunGlyph {
+        fn shapeRun(ptr: *anyopaque, alloc: std.mem.Allocator, font: FontId, text: []const u8, rtl: bool, features: []const Feature) ShapeError![]ShapedRunGlyph {
             shape_calls += 1;
             if (font == FALLBACK_FONT_ID) return error.FontUnavailable;
-            return CharmapAdapter.charmapShapeRun(ptr, alloc, font, text, rtl);
+            return CharmapAdapter.charmapShapeRun(ptr, alloc, font, text, rtl, features);
         }
         fn fallbackFor(ptr: *anyopaque, query: FontQuery, script: Script, attempt: usize) ?FontId {
             _ = ptr;
@@ -3935,20 +3954,6 @@ test "ellipsis falls back to dots when U+2026 is missing" {
     const glyphs = try shapeEllipsis(std.testing.allocator, backend.adapter(), &buf, &attrs.default_attrs, .basic, false);
     defer std.testing.allocator.free(glyphs);
     try std.testing.expectEqual(@as(usize, 3), glyphs.len);
-}
-
-test "plan cache is FIFO with cap 6" {
-    var cache = PlanCache{};
-    for (0..6) |i| {
-        const idx = cache.getOrPut(@intCast(i + 1), .latin, false);
-        try std.testing.expectEqual(i, idx);
-    }
-    // Hit does not reorder (least-recently-added eviction, not LRU).
-    try std.testing.expectEqual(@as(usize, 0), cache.getOrPut(1, .latin, false));
-    _ = cache.getOrPut(7, .latin, false);
-    try std.testing.expectEqual(@as(usize, 6), cache.len);
-    try std.testing.expect(cache.find(1, .latin, false) == null);
-    try std.testing.expect(cache.find(7, .latin, false) != null);
 }
 
 test "fitGlyphs and remainingContentExceeds units" {

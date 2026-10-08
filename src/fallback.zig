@@ -219,6 +219,13 @@ pub fn hanUnification(locale: []const u8) []const []const u8 {
 }
 
 /// Per-script fallbacks, verbatim from `unix.rs`.
+/// Platform common fallback families, verbatim from `fallback/unix.rs`.
+///
+/// Exposed so the connected `FontSystem` resolver can apply the same
+/// script-then-common phase order as `FontFallbackIter` without duplicating the
+/// table.
+pub const PLATFORM_COMMON_FALLBACK: []const []const u8 = COMMON_FALLBACK;
+
 pub fn scriptFallbackUnix(script: Script, locale: []const u8) []const []const u8 {
     return switch (script) {
         .adlam => S_ADLAM,

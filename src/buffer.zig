@@ -315,6 +315,15 @@ pub const DirtyFlags = packed struct(u8) {
 };
 
 /// A buffer of shaped/laid-out text, mirroring cosmic-text `Buffer`.
+/// Normalize one optional viewport dimension: negative clamps to 0, and
+/// non-finite becomes unbounded (`null`) instead of propagating a NaN into
+/// every viewport comparison.
+fn normalizeDimension(value: ?f32) ?f32 {
+    const v = value orelse return null;
+    if (!std.math.isFinite(v)) return null;
+    return @max(v, 0);
+}
+
 pub const Buffer = struct {
     allocator: Allocator,
     lines: std.ArrayList(BufferLine),
@@ -333,8 +342,14 @@ pub const Buffer = struct {
 
     /// Create an empty buffer. Errors on zero `line_height` (the Rust
     /// original panics; this port returns `error.InvalidMetrics`).
+    /// Validate `metrics` for public entry points: both fields finite and
+    /// positive. See `Metrics.isValid`.
+    pub fn validateMetrics(metrics: Metrics) Error!void {
+        if (!metrics.isValid()) return error.InvalidMetrics;
+    }
+
     pub fn initWithAllocator(allocator: Allocator, metrics: Metrics) Error!Buffer {
-        if (metrics.line_height == 0) return error.InvalidMetrics;
+        try validateMetrics(metrics);
         return .{
             .allocator = allocator,
             .lines = .empty,
@@ -654,9 +669,15 @@ pub const Buffer = struct {
         return self.metrics;
     }
 
+    /// Set font size and line height.
+    ///
+    /// Rejects non-finite or non-positive values with `error.InvalidMetrics`
+    /// (see `Metrics.isValid`). The previous check only rejected exactly zero,
+    /// which let negative sizes, NaN and infinity into every layout sum and
+    /// cache key.
     pub fn setMetrics(self: *Buffer, metrics: Metrics) Error!void {
         if (!Metrics.eql(metrics, self.metrics)) {
-            if (metrics.font_size == 0 or metrics.line_height == 0) {
+            if (!metrics.isValid()) {
                 return error.InvalidMetrics;
             }
             self.metrics = metrics;
@@ -744,9 +765,15 @@ pub const Buffer = struct {
         return .{ .width = self.width_opt, .height = self.height_opt };
     }
 
+    /// Set the drawable width/height.
+    ///
+    /// A negative dimension clamps to 0 (unbounded layout, matching upstream),
+    /// but a NaN or infinite one is a caller bug that would poison every
+    /// comparison against the viewport, so it is normalized to `null`
+    /// (unbounded) here rather than propagated.
     pub fn setSize(self: *Buffer, width_opt: ?f32, height_opt: ?f32) void {
-        const w = if (width_opt) |v| @max(v, 0) else null;
-        const h = if (height_opt) |v| @max(v, 0) else null;
+        const w = normalizeDimension(width_opt);
+        const h = normalizeDimension(height_opt);
         if (w != self.width_opt) {
             self.width_opt = w;
             self.dirty.relayout = true;
@@ -1723,9 +1750,24 @@ const TestFontSystem = struct {
         // disarm the caller-side errdefer before handing it over.
         const owned_db = db_opt.?;
         db_opt = null;
+        var fs = try FontSystem.initWithDb(allocator, owned_db, "en-US");
+        errdefer fs.deinit();
+
+        // Register every face with the shaping backend. Without this the shaper
+        // has no usable source for any id, `fontFor` answers null, and every
+        // face shapes through the backend's single default face: real
+        // per-font advances and metrics were therefore untestable here even
+        // though the HarfBuzz bridge has been wired for a long time.
+        for (test_fonts, paths.items) |spec, path| {
+            for (fs.db.faces.items) |*face| {
+                if (!fs.db.faceContainsFamily(face.id, spec.family)) continue;
+                try fs.addFontSource(face.id, path, 0, false, spec.mono, null);
+            }
+        }
+
         return .{
             .allocator = allocator,
-            .font_system = try FontSystem.initWithDb(allocator, owned_db, "en-US"),
+            .font_system = fs,
             .paths = paths,
         };
     }
@@ -2433,6 +2475,10 @@ test "real font geometry: FontSystem faces drive shaped layout" {
     try b.setText("Hamburgefonstiv", &inter, .advanced, null);
     try b.shapeUntilScroll(&tfs.font_system, false);
     const lines = (try b.lineLayout(&tfs.font_system, 0)).?;
+    // Read every value out of `lines` before the next `setText`: the layout
+    // cache it borrows from is invalidated and freed by that call.
+    const inter_width = lines[0].w;
+    const inter_glyph_count = lines[0].glyphs.items.len;
 
     // Line width is the sum of shaped glyph advances, and hit/cursor math
     // reads those same glyphs (no `size * 0.6` re-derivation in Buffer).
@@ -2441,7 +2487,8 @@ test "real font geometry: FontSystem faces drive shaped layout" {
         try testing.expect(g.w > 0);
         sum += g.w;
     }
-    try testing.expectApproxEqAbs(lines[0].w, sum, 1e-2);
+    try testing.expectApproxEqAbs(inter_width, sum, 1e-2);
+    try testing.expect(inter_glyph_count > 0);
     const g0 = lines[0].glyphs.items[0];
     const pos = b.cursorPosition(&Cursor.new(0, g0.end)).?;
     try testing.expectApproxEqAbs(g0.x + g0.w, pos.x, 1e-3);
@@ -2451,15 +2498,14 @@ test "real font geometry: FontSystem faces drive shaped layout" {
     try b.setText("Hamburgefonstiv", &mono, .advanced, null);
     try b.shapeUntilScroll(&tfs.font_system, false);
     const mono_lines = (try b.lineLayout(&tfs.font_system, 0)).?;
+    const mono_width = mono_lines[0].w;
     try testing.expect(mono_lines[0].glyphs.items.len > 0);
-    try testing.expect(mono_lines[0].w > 0);
+    try testing.expect(mono_width > 0);
 
-    // TODO(shape/font): per-font advances/metrics are blocked on
-    // `buffer_line.zig`'s FontSystem-backed ShapeAdapter. Today it builds
-    // shape.zig's `CharmapAdapter` (the marked HarfBuzz wiring point), which
-    // reports one EM advance/ascent for every face, so Inter and Fira Mono
-    // currently shape identically. Once that bridge lands, assert here:
-    // `lines[0].w != mono_lines[0].w` (or differing `max_ascent`/`font_id`).
+    // `tfs.font_system` is a real HarfBuzz-backed FontSystem, so per-font
+    // advances do differ; the monospace face must measure differently from the
+    // proportional one even though both hold the same text.
+    try testing.expect(inter_width != mono_width);
 }
 
 test "real font geometry: advances scale with font size" {

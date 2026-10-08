@@ -17,9 +17,10 @@
 //! candidate name fails, `lookupSymbol` returns `null` for a missing symbol,
 //! and the caller turns that into a named error. Nothing aborts or panics.
 //!
-//! This file itself keeps no shared mutable state; the per-library `dyn.zig`
-//! loaders own their caches and serialize the first load with the `Mutex`
-//! below. Shaping/layout text remains single-threaded by contract.
+//! The per-library `dyn.zig` loaders own their caches and serialize the first
+//! load with `Mutex`. `source_io_mutex` separately guards the single-threaded
+//! I/O instance used for lazy font reads by both native backends.
+//! Shaping/layout text remains single-threaded by contract.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -49,6 +50,14 @@ pub const Mutex = struct {
         self.inner.unlock();
     }
 };
+
+/// Shared guard for `std.Io.Threaded.global_single_threaded` font-source I/O.
+///
+/// Both the HarfBuzz and FreeType registries import this named module, so
+/// independent shapers and rasters cannot race inside the same I/O instance.
+/// This protects file reads, not concurrent access to a registry's entries,
+/// HarfBuzz buffers, or FreeType faces; those remain single-threaded.
+pub var source_io_mutex: Mutex = .{};
 
 /// A loaded shared library handle.
 ///

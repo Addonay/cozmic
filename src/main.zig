@@ -1,71 +1,75 @@
-const std = @import("std");
-const Io = std.Io;
+//! Minimal `cozmic` executable: shape and lay out one line and print the
+//! resulting glyph metrics.
+//!
+//! This replaces the `zig init` template program. It exists to prove the
+//! library works from an external crate-like entry point (real font
+//! registration, real HarfBuzz shaping, real layout) and to give `zig build run`
+//! something meaningful to do.
+//!
+//! Runtime requirements are the same as the library's: HarfBuzz and FreeType
+//! must be loadable at runtime, and a font must be resolvable.
 
+const std = @import("std");
 const cozmic = @import("cozmic");
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
-    }
-
-    // In order to do I/O operations need an `Io` instance.
+    const arena = init.arena.allocator();
     const io = init.io;
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    var out_buffer: [4096]u8 = undefined;
+    var out_file: std.Io.File.Writer = .init(.stdout(), io, &out_buffer);
+    const out = &out_file.interface;
 
-    try cozmic.printAnotherMessage(stdout_writer);
+    var fs = try cozmic.FontSystem.init(arena);
+    defer fs.deinit();
 
-    try stdout_writer.flush(); // Don't forget to flush!
-}
+    // Use the host's fonts when they are discoverable; otherwise the shape run
+    // falls back to whatever `FontSystem` has and the report below shows the
+    // resulting glyph count (possibly zero for unsupported characters).
+    const stats = fs.loadSystemFonts(io);
+    try out.print("fonts: {d} faces, {d} errors\n", .{
+        stats.faces_added,
+        stats.file_errors,
+    });
+    if (!fs.hasShaper()) {
+        try out.print("no HarfBuzz backend available; nothing to shape\n", .{});
+        try out.flush();
+        return;
+    }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    // Generic family: resolves through the host's configured sans-serif
+    // default, so the demo does not depend on a specific family being
+    // installed. Named families still work through `FontSystem.setSansFamily`
+    // or `attrs.family = .{ .name = ... }`.
+    var attrs = cozmic.Attrs.init(arena);
+    attrs.family = .sans_serif;
+    attrs.color_opt = cozmic.Color.rgb(0, 0, 0);
 
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
+    var buffer = try cozmic.Buffer.initWithAllocator(arena, cozmic.Metrics.new(16, 20));
+    buffer.setSize(400, null);
+    try buffer.setText("The quick brown fox jumps over the lazy dog.", &attrs, .advanced, null);
+    try buffer.shapeUntilScroll(&fs, false);
 
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try command `zig build test --fuzz -Doptimize=ReleaseFast` to see if it manages to fail this test case!
+    var lines: usize = 0;
+    var glyphs: usize = 0;
+    var missing: usize = 0;
+    var width: f32 = 0;
+    var it = buffer.layoutRuns();
+    while (it.next()) |run| {
+        lines += 1;
+        width = run.line_w;
+        for (run.glyphs) |g| {
+            if (g.glyph_id == 0) {
+                missing += 1;
+            } else {
+                glyphs += 1;
+            }
+        }
+    }
 
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+    try out.print(
+        "shaped {d} line(s): {d} glyphs, {d} missing, last line width {d:.2}px\n",
+        .{ lines, glyphs, missing, width },
+    );
+    try out.flush();
 }

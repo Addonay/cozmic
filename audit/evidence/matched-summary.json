@@ -1,0 +1,202 @@
+{
+  "rows": [
+    {
+      "engine": "cozmic",
+      "trial": 0,
+      "workload": "small",
+      "median_ns": 12734,
+      "glyphs": 13,
+      "width_sum": 58.536934,
+      "rss_kib": 9468
+    },
+    {
+      "engine": "cozmic",
+      "trial": 0,
+      "workload": "latin",
+      "median_ns": 3537624,
+      "glyphs": 4201,
+      "width_sum": 20876.428,
+      "rss_kib": 9468
+    },
+    {
+      "engine": "cozmic",
+      "trial": 0,
+      "workload": "arabic",
+      "median_ns": 1819352,
+      "glyphs": 1334,
+      "width_sum": 4934.8843,
+      "rss_kib": 9468
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 0,
+      "workload": "small",
+      "median_ns": 16792,
+      "glyphs": 13,
+      "width_sum": 58.536934,
+      "rss_kib": 5412
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 0,
+      "workload": "latin",
+      "median_ns": 4310654,
+      "glyphs": 4201,
+      "width_sum": 20876.428,
+      "rss_kib": 5412
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 0,
+      "workload": "arabic",
+      "median_ns": 1846563,
+      "glyphs": 1334,
+      "width_sum": 4934.8843,
+      "rss_kib": 5412
+    },
+    {
+      "engine": "cozmic",
+      "trial": 1,
+      "workload": "small",
+      "median_ns": 12594,
+      "glyphs": 13,
+      "width_sum": 58.536934,
+      "rss_kib": 9232
+    },
+    {
+      "engine": "cozmic",
+      "trial": 1,
+      "workload": "latin",
+      "median_ns": 3600352,
+      "glyphs": 4201,
+      "width_sum": 20876.428,
+      "rss_kib": 9232
+    },
+    {
+      "engine": "cozmic",
+      "trial": 1,
+      "workload": "arabic",
+      "median_ns": 1822488,
+      "glyphs": 1334,
+      "width_sum": 4934.8843,
+      "rss_kib": 9232
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 1,
+      "workload": "small",
+      "median_ns": 16681,
+      "glyphs": 13,
+      "width_sum": 58.536934,
+      "rss_kib": 5412
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 1,
+      "workload": "latin",
+      "median_ns": 4309181,
+      "glyphs": 4201,
+      "width_sum": 20876.428,
+      "rss_kib": 5412
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 1,
+      "workload": "arabic",
+      "median_ns": 1831255,
+      "glyphs": 1334,
+      "width_sum": 4934.8843,
+      "rss_kib": 5412
+    },
+    {
+      "engine": "cozmic",
+      "trial": 2,
+      "workload": "small",
+      "median_ns": 12613,
+      "glyphs": 13,
+      "width_sum": 58.536934,
+      "rss_kib": 9044
+    },
+    {
+      "engine": "cozmic",
+      "trial": 2,
+      "workload": "latin",
+      "median_ns": 3559435,
+      "glyphs": 4201,
+      "width_sum": 20876.428,
+      "rss_kib": 9044
+    },
+    {
+      "engine": "cozmic",
+      "trial": 2,
+      "workload": "arabic",
+      "median_ns": 1817739,
+      "glyphs": 1334,
+      "width_sum": 4934.8843,
+      "rss_kib": 9044
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 2,
+      "workload": "small",
+      "median_ns": 16932,
+      "glyphs": 13,
+      "width_sum": 58.536934,
+      "rss_kib": 5156
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 2,
+      "workload": "latin",
+      "median_ns": 4335721,
+      "glyphs": 4201,
+      "width_sum": 20876.428,
+      "rss_kib": 5156
+    },
+    {
+      "engine": "cosmic-text",
+      "trial": 2,
+      "workload": "arabic",
+      "median_ns": 1841894,
+      "glyphs": 1334,
+      "width_sum": 4934.8843,
+      "rss_kib": 5156
+    }
+  ],
+  "summary": [
+    {
+      "workload": "small",
+      "cozmic_ns": 12613,
+      "cosmic_ns": 16792,
+      "ratio": 0.7511314911862792,
+      "glyphs": 13,
+      "width_sum": 58.536934
+    },
+    {
+      "workload": "latin",
+      "cozmic_ns": 3559435,
+      "cosmic_ns": 4310654,
+      "ratio": 0.8257296920606478,
+      "glyphs": 4201,
+      "width_sum": 20876.428
+    },
+    {
+      "workload": "arabic",
+      "cozmic_ns": 1819352,
+      "cosmic_ns": 1841894,
+      "ratio": 0.9877615107058278,
+      "glyphs": 1334,
+      "width_sum": 4934.8843
+    }
+  ],
+  "binaries": {
+    "cozmic": {
+      "path": ".zig-cache/o/5d9c716ae27cd5dbee93c0fbe9bc6f87/audit-matched",
+      "bytes": 6087888
+    },
+    "cosmic-text": {
+      "path": ".reference/cosmic-text/target/release/cozmic-audit",
+      "bytes": 2120176
+    }
+  }
+}

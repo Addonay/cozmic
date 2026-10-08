@@ -1,0 +1,114 @@
+diff --git a/benches/layout.rs b/benches/layout.rs
+index 5b174ea..40daaf3 100644
+--- a/benches/layout.rs
++++ b/benches/layout.rs
+@@ -1,6 +1,28 @@
+ use cosmic_text as ct;
+ use criterion::{black_box, criterion_group, criterion_main, Criterion};
+ 
++/// cozmic bench-fairness patch (2026-09-11): build the font system from the
++/// same vendored fonts the cozmic benches load, so ratios compare engines
++/// rather than font sets. `new_with_fonts` still scans system fonts; the host
++/// has no Inter/FiraMono installed, so the generic-family overrides below
++/// resolve to these exact vendored faces.
++fn cozmic_font_system() -> ct::FontSystem {
++    use std::sync::Arc;
++    let sources = [
++        include_bytes!("../../../tests/fonts/Inter-Regular.ttf").as_slice(),
++        include_bytes!("../../../tests/fonts/NotoSansArabic.ttf").as_slice(),
++        include_bytes!("../../../tests/fonts/NotoSansHebrew.ttf").as_slice(),
++        include_bytes!("../../../tests/fonts/FiraMono-Medium.ttf").as_slice(),
++    ]
++    .into_iter()
++    .map(|bytes| ct::fontdb::Source::Binary(Arc::new(bytes.to_vec())));
++    let mut fs = ct::FontSystem::new_with_fonts(sources);
++    fs.db_mut().set_sans_serif_family("Inter");
++    fs.db_mut().set_monospace_family("FiraMono");
++    fs
++}
++
++
+ fn load_font_system(c: &mut Criterion) {
+     c.bench_function("load FontSystem", |b| {
+         b.iter(|| black_box(ct::FontSystem::new()))
+@@ -8,7 +30,7 @@ fn load_font_system(c: &mut Criterion) {
+ }
+ 
+ fn layout(c: &mut Criterion) {
+-    let mut fs = ct::FontSystem::new();
++    let mut fs = cozmic_font_system();
+     let mut buffer = ct::Buffer::new(&mut fs, ct::Metrics::new(10.0, 10.0));
+     buffer.set_size(Some(80.0), None);
+ 
+diff --git a/benches/text_shaping_benchmarks.rs b/benches/text_shaping_benchmarks.rs
+index cfba990..8e96b6b 100644
+--- a/benches/text_shaping_benchmarks.rs
++++ b/benches/text_shaping_benchmarks.rs
+@@ -2,8 +2,30 @@ use cosmic_text as ct;
+ use cosmic_text::BidiParagraphs;
+ use criterion::{black_box, criterion_group, criterion_main, Criterion};
+ 
++/// cozmic bench-fairness patch (2026-09-11): build the font system from the
++/// same vendored fonts the cozmic benches load, so ratios compare engines
++/// rather than font sets. The host has no Inter/FiraMono installed, so the
++/// generic-family overrides below
++/// resolve to these exact vendored faces.
++fn cozmic_font_system() -> ct::FontSystem {
++    use std::sync::Arc;
++    let sources = [
++        include_bytes!("../../../tests/fonts/Inter-Regular.ttf").as_slice(),
++        include_bytes!("../../../tests/fonts/NotoSansArabic.ttf").as_slice(),
++        include_bytes!("../../../tests/fonts/NotoSansHebrew.ttf").as_slice(),
++        include_bytes!("../../../tests/fonts/FiraMono-Medium.ttf").as_slice(),
++    ]
++    .into_iter()
++    .map(|bytes| ct::fontdb::Source::Binary(Arc::new(bytes.to_vec())));
++    let mut fs = ct::FontSystem::new_with_fonts(sources);
++    fs.db_mut().set_sans_serif_family("Inter");
++    fs.db_mut().set_monospace_family("FiraMono");
++    fs
++}
++
++
+ fn bench_ascii_fast_path(c: &mut Criterion) {
+-    let mut fs = ct::FontSystem::new();
++    let mut fs = cozmic_font_system();
+     let mut buffer = ct::Buffer::new(&mut fs, ct::Metrics::new(14.0, 20.0));
+     buffer.set_size(Some(500.0), None);
+ 
+@@ -23,7 +45,7 @@ fn bench_ascii_fast_path(c: &mut Criterion) {
+ }
+ 
+ fn bench_bidi_processing(c: &mut Criterion) {
+-    let mut fs = ct::FontSystem::new();
++    let mut fs = cozmic_font_system();
+     let mut buffer = ct::Buffer::new(&mut fs, ct::Metrics::new(14.0, 20.0));
+     buffer.set_size(Some(500.0), None);
+ 
+@@ -43,7 +65,7 @@ fn bench_bidi_processing(c: &mut Criterion) {
+ }
+ 
+ fn bench_lang_mixed(c: &mut Criterion) {
+-    let mut fs = ct::FontSystem::new();
++    let mut fs = cozmic_font_system();
+     let mut buffer = ct::Buffer::new(&mut fs, ct::Metrics::new(14.0, 20.0));
+     buffer.set_size(Some(500.0), None);
+ 
+@@ -65,7 +87,7 @@ fn bench_lang_mixed(c: &mut Criterion) {
+ }
+ 
+ fn bench_layout_heavy(c: &mut Criterion) {
+-    let mut fs = ct::FontSystem::new();
++    let mut fs = cozmic_font_system();
+     let mut buffer = ct::Buffer::new(&mut fs, ct::Metrics::new(14.0, 20.0));
+     buffer.set_size(Some(500.0), None);
+ 
+@@ -85,7 +107,7 @@ fn bench_layout_heavy(c: &mut Criterion) {
+ }
+ 
+ fn bench_combined_stress(c: &mut Criterion) {
+-    let mut fs = ct::FontSystem::new();
++    let mut fs = cozmic_font_system();
+     let mut buffer = ct::Buffer::new(&mut fs, ct::Metrics::new(14.0, 20.0));
+     buffer.set_size(Some(500.0), None);
+ 

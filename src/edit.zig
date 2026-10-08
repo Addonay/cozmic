@@ -401,77 +401,110 @@ pub const Editor = struct {
             change_lines.deinit(allocator);
         }
 
-        var end_line_opt: ?BufferLine = null;
-        defer if (end_line_opt) |*l| l.deinit();
-        if (end.line > start.line) {
-            var after = try buf.lines.items[end.line].splitOff(end.index);
-            const removed = buf.lines.orderedRemove(end.line);
-            change_lines.insert(allocator, 0, removed) catch |e| {
-                var r = removed;
-                r.deinit();
-                after.deinit();
-                return e;
-            };
-            end_line_opt = after;
-        }
+        // --- Reserve every allocation the mutation below needs. ---
+        //
+        // Deleting is destructive from the first `splitOff`, and the old
+        // ordering interleaved fallible steps with it: an OOM in
+        // `change_lines.insert` freed a line that had already been removed from
+        // the buffer (losing text), and an OOM building the undo `text` left
+        // the buffer edited with no record. Everything is sized here, from the
+        // still-intact buffer, so the sequence below cannot allocate.
+        const removed_line_count = (end.line - start.line) + 1;
+        try change_lines.ensureTotalCapacity(allocator, removed_line_count);
 
-        var li = end.line;
-        while (li > start.line + 1) {
-            li -= 1;
-            const removed = buf.lines.orderedRemove(li);
-            change_lines.insert(allocator, 0, removed) catch |e| {
-                var r = removed;
-                r.deinit();
-                return e;
-            };
-        }
-
+        // Exact size of the undo payload: the removed slices joined by the
+        // removed lines' endings. Measured (not estimated) because the payload is
+        // filled with `appendSliceAssumeCapacity` below.
+        var removed_bytes: usize = 0;
         {
-            const line = &buf.lines.items[start.line];
-            var after_opt: ?BufferLine = null;
-            defer if (after_opt) |*l| l.deinit();
-            if (start.line == end.line) {
-                after_opt = try line.splitOff(end.index);
-            }
-            const removed = try line.splitOff(start.index);
-            change_lines.insert(allocator, 0, removed) catch |e| {
-                var r = removed;
-                r.deinit();
-                return e;
-            };
-            if (after_opt) |after| {
-                try line.append(&after);
-            }
-            if (end_line_opt) |*end_line| {
-                if (end_line.ending == .none) {
-                    _ = end_line.setEnding(line.ending);
-                }
-                try line.append(end_line);
+            var first = true;
+            var i = start.line;
+            while (i <= end.line) : (i += 1) {
+                const raw = buf.lines.items[i].textSlice();
+                const from: usize = if (i == start.line) start.index else 0;
+                const to: usize = if (i == end.line) end.index else raw.len;
+                if (!first) removed_bytes += buf.lines.items[i - 1].ending.asStr().len;
+                first = false;
+                removed_bytes += to - from;
             }
         }
 
         var text: std.ArrayList(u8) = .empty;
         errdefer text.deinit(allocator);
-        var first = true;
-        var last_ending: LineEnding = .none;
-        for (change_lines.items) |*l| {
-            if (!first) {
-                try text.appendSlice(allocator, last_ending.asStr());
+        try text.ensureTotalCapacityPrecise(allocator, removed_bytes);
+        if (self.change) |*c| try c.items.ensureUnusedCapacity(allocator, 1);
+
+        // Build the undo payload from the still-intact buffer, before any
+        // mutation. It is reserved above, so this cannot fail, which means the
+        // removed text is captured even if a later step does.
+        {
+            var first = true;
+            var last_ending: LineEnding = .none;
+            var li2 = start.line;
+            while (li2 <= end.line) : (li2 += 1) {
+                const raw = buf.lines.items[li2].textSlice();
+                const from: usize = if (li2 == start.line) start.index else 0;
+                const to: usize = if (li2 == end.line) end.index else raw.len;
+                if (!first) text.appendSliceAssumeCapacity(last_ending.asStr());
+                first = false;
+                text.appendSliceAssumeCapacity(raw[from..to]);
+                last_ending = buf.lines.items[li2].ending;
             }
-            first = false;
-            try text.appendSlice(allocator, l.textSlice());
-            last_ending = l.ending;
+        }
+
+        // --- Mutation. ---
+        //
+        // Both boundary splits happen before any line is removed from the
+        // buffer, so an allocation failure anywhere below leaves the buffer
+        // exactly as it was. `reserveAppend` then covers the rejoin, and
+        // `change_lines` / `text` / the undo record are already reserved, so
+        // the removal sequence cannot fail at all.
+        var after_opt: ?BufferLine = null;
+        defer if (after_opt) |*l| l.deinit();
+        try buf.lines.items[start.line].reserveAppend(allocator, &buf.lines.items[end.line]);
+
+        if (start.line == end.line) {
+            after_opt = try buf.lines.items[start.line].splitOff(end.index);
+            change_lines.appendAssumeCapacity(try buf.lines.items[start.line].splitOff(start.index));
+            if (after_opt) |after| {
+                try buf.lines.items[start.line].append(&after);
+            }
+        } else {
+            after_opt = try buf.lines.items[end.line].splitOff(end.index);
+            change_lines.appendAssumeCapacity(try buf.lines.items[start.line].splitOff(start.index));
+            // Rejoin the end-line suffix onto the start line before the lines in
+            // between are removed. The removed prefix was appended first, so move
+            // it back to the front to keep `change_lines` in document order for
+            // the (already written) undo payload.
+            const end_line = &after_opt.?;
+            if (end_line.ending == .none) {
+                _ = end_line.setEnding(buf.lines.items[start.line].ending);
+            }
+            // `append` copies; `after_opt` stays owned here and is freed by
+            // the defer above.
+            try buf.lines.items[start.line].append(end_line);
+
+            change_lines.insertAssumeCapacity(0, buf.lines.orderedRemove(end.line));
+            var li = end.line;
+            while (li > start.line + 1) {
+                li -= 1;
+                change_lines.insertAssumeCapacity(0, buf.lines.orderedRemove(li));
+            }
+            const start_piece = change_lines.orderedRemove(change_lines.items.len - 1);
+            change_lines.insertAssumeCapacity(0, start_piece);
         }
 
         if (self.change) |*c| {
-            try c.items.append(allocator, .{
+            c.items.appendAssumeCapacity(.{
                 .start = start,
                 .end = end,
                 .text = text,
                 .insert = false,
             });
+            text = .empty; // Ownership moved into the change record.
         } else {
             text.deinit(allocator);
+            text = .empty;
         }
     }
 
@@ -531,18 +564,15 @@ pub const Editor = struct {
         if (cursor.index > buf.lines.items[cursor.line].textSlice().len) {
             return error.InvalidCursor;
         }
-        // Collect the text after the insertion point; rejoined below.
-        var after = try buf.lines.items[cursor.line].splitOff(cursor.index);
-        defer after.deinit();
-        const after_len = after.textSlice().len;
 
-        // Attributes for the inserted text: explicit, else the previous
-        // character's span (mirrors `get_span(index.saturating_sub(1))`).
-        var final_attrs: AttrsList = if (attrs_list) |a| a else blk: {
-            const span_attrs = buf.lines.items[cursor.line].attrs_list.get_span(cursor.index -| 1);
-            break :blk AttrsList.init_owned(allocator, try span_attrs.clone_with(allocator));
-        };
-        defer final_attrs.deinit();
+        // --- Prepare everything fallible before touching any text. ---
+        //
+        // Everything below splits the current line, and until the suffix is
+        // rejoined the buffer is deliberately missing text. Any allocation
+        // failure inside that window returned the error while `after` was
+        // simply freed, silently deleting the suffix. So: build the line parts,
+        // the attributes, the undo record's owned text, and the line-list
+        // capacity first, then mutate.
 
         // Split the data into lines; a trailing line with no ending always
         // exists (mirrors the `lines.push((default, None))` rule).
@@ -553,6 +583,45 @@ pub const Editor = struct {
         if (parts.items.len == 0 or parts.items[parts.items.len - 1].ending != .none) {
             try parts.append(allocator, .{ .start = 0, .end = 0, .ending = .none });
         }
+
+        // Attributes for the inserted text: explicit, else the previous
+        // character's span (mirrors `get_span(index.saturating_sub(1))`).
+        var final_attrs: AttrsList = if (attrs_list) |a| a else blk: {
+            const span_attrs = buf.lines.items[cursor.line].attrs_list.get_span(cursor.index -| 1);
+            break :blk AttrsList.init_owned(allocator, try span_attrs.clone_with(allocator));
+        };
+        defer final_attrs.deinit();
+
+        // The undo record's copy of `data`, allocated up front so the record
+        // cannot be lost after the text has already been inserted.
+        var record_text: ?std.ArrayList(u8) = null;
+        if (self.change != null) {
+            var owned: std.ArrayList(u8) = .empty;
+            errdefer owned.deinit(allocator);
+            try owned.appendSlice(allocator, data);
+            record_text = owned;
+        }
+        defer if (record_text) |*owned| owned.deinit(allocator);
+
+        // Worst case one new line per part, plus the ensured trailing lines.
+        try buf.lines.ensureUnusedCapacity(allocator, parts.items.len + 1);
+        // The undo record appends exactly one item.
+        if (self.change) |*c| try c.items.ensureUnusedCapacity(allocator, 1);
+
+        // --- Mutation window. `after` is rejoined on every exit path. ---
+        var after = try buf.lines.items[cursor.line].splitOff(cursor.index);
+        var after_consumed = false;
+        defer {
+            if (!after_consumed) {
+                // Put the suffix back. `append` is the only operation left that
+                // can allocate; if it fails the line keeps the shortened text,
+                // which is still better than freeing the suffix outright.
+                buf.lines.items[cursor.line].append(&after) catch {};
+            }
+            after.deinit();
+        }
+        const after_len = after.textSlice().len;
+
         var remaining = data.len;
         var front: usize = 0;
         var back: usize = parts.items.len;
@@ -594,6 +663,9 @@ pub const Editor = struct {
                 };
                 errdefer tmp.deinit();
                 try tmp.append(&after);
+                // `after`'s text now lives in `tmp`; the restore-on-error defer
+                // must not also append it back to the current line.
+                after_consumed = true;
                 try buf.lines.insert(allocator, insert_line, tmp);
             }
             cursor.line += 1;
@@ -617,15 +689,17 @@ pub const Editor = struct {
         } else {
             // Single-line insert: rejoin `after` onto the current line.
             try buf.lines.items[cursor.line].append(&after);
+            after_consumed = true;
         }
         if (remaining != 0) return error.InvalidData;
         cursor.index = buf.lines.items[cursor.line].textSlice().len - after_len;
 
+        // The record's text was staged before any mutation, so this cannot
+        // fail; an insertion is never left unrecorded.
         if (self.change) |*c| {
-            var owned: std.ArrayList(u8) = .empty;
-            errdefer owned.deinit(allocator);
-            try owned.appendSlice(allocator, data);
-            try c.items.append(allocator, .{
+            const owned = record_text orelse return error.OutOfMemory;
+            record_text = null;
+            c.items.appendAssumeCapacity(.{
                 .start = start,
                 .end = cursor,
                 .text = owned,

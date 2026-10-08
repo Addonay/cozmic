@@ -14,8 +14,12 @@
 //!   loader in `fontconfig.zig` (lazy sources, no bytes); the per-file
 //!   directory scan below is the cross-platform fallback.
 //! - variable-weight matching: `FontMatchKey.init` reads the face's
-//!   `variable_wght_min/max` (`fvar` via FreeType `FT_Get_MM_Var` / skrifa
-//!   `axes().get_by_tag("wght")` in production); see `variableWeightMatch`.
+//!   `variable_wght_min/max`. Those are filled by `font_parse` from the `fvar`
+//!   table on the byte/`addFaceFromBytes` and directory-scan paths, but the
+//!   fontconfig path registers faces without reading them, so a system
+//!   variable font currently has no `wght` range and will only match at its
+//!   nominal weight. See `variableWeightMatch` and
+//!   `FaceInfo.variable_wght_min`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,6 +27,7 @@ const shape_hb = @import("shape_hb.zig");
 const shape_mod = @import("shape.zig");
 const font_parse = @import("font_parse.zig");
 const fontconfig = @import("fontconfig.zig");
+const fallback = @import("fallback.zig");
 
 // ---------------------------------------------------------------------------
 // Local aliases (do NOT import attrs.zig yet; see header TODO).
@@ -121,20 +126,22 @@ pub const FaceInfo = struct {
     stretch: Stretch,
     style: Style,
     monospaced: bool,
-    /// Variable `wght`-axis range (from `fvar`/`FT_Get_MM_Var`); null when the
-    /// face is not variable or the range is unknown. Used by
-    /// `variableWeightMatch` / `FontMatchKey.init` (M2 wiring point).
+    /// Variable `wght`-axis range, parsed from the `fvar` table; null when the
+    /// face is not variable or the table was never read (currently: every face
+    /// registered through the fontconfig path). Used by
+    /// `variableWeightMatch` / `FontMatchKey.init`.
     variable_wght_min: ?Weight = null,
     variable_wght_max: ?Weight = null,
 };
 
-/// Variable-weight coverage check (M2 wiring point).
+/// Variable-weight coverage check.
 /// Mirrors `FontMatchKey::new`'s `variable_weight_match` axis query
 /// (`system.rs:38-44`): true when the wanted weight differs from the face's
 /// nominal weight but lies inside the face's `wght` variation range.
-/// Production wiring fills `variable_wght_min/max` from the font's `fvar`
-/// table (FreeType `FT_Get_MM_Var` / skrifa `axes().get_by_tag("wght")`);
-/// the comparison itself is already verbatim.
+/// `variable_wght_min/max` are filled from the font's `fvar` table by
+/// `font_parse`; faces registered without reading their bytes (currently the
+/// fontconfig path) carry no range and therefore only match at their nominal
+/// weight.
 pub fn variableWeightMatch(wanted: Weight, nominal: Weight, wght_min: ?Weight, wght_max: ?Weight) bool {
     if (wanted == nominal) return false;
     const lo = wght_min orelse return false;
@@ -390,9 +397,10 @@ pub const FontDb = struct {
         return false;
     }
 
-    /// Set a face's variable `wght` range (M2 wiring point).
-    /// Returns false for unknown ids. Production fills this from the font's
-    /// `fvar` table at load time; tests use it to simulate variable fonts.
+    /// Set a face's variable `wght` range explicitly.
+    /// Returns false for unknown ids. `font_parse` calls this with the `fvar`
+    /// values it read; tests use it to simulate variable faces whose bytes were
+    /// not parsed.
     pub fn setVariableWghtRange(self: *FontDb, id: FontId, min: Weight, max: Weight) bool {
         for (self.faces.items) |*f| {
             if (f.id == id) {
@@ -858,11 +866,47 @@ fn resolverStyle(style: u8) Style {
     };
 }
 
+/// Map a `unicode.Script` onto the richer `fallback.Script` used by the
+/// vendored platform fallback tables.
+///
+/// `unicode.Script` deliberately collapses every assigned script it does not
+/// track into `.other` (see `unicode.mapScriptType`), so only the tracked
+/// scripts can be routed to a script-specific family list. `.other`,
+/// `.common`, `.inherited`, `.latin`, `.greek` and `.cyrillic` have no
+/// fallback table and correctly fall through to the platform common list.
+fn fallbackScript(script: shape_mod.Script) ?fallback.Script {
+    return switch (script) {
+        .armenian => .armenian,
+        .hebrew => .hebrew,
+        .arabic => .arabic,
+        .devanagari => .devanagari,
+        .bengali => .bengali,
+        .tamil => .tamil,
+        .telugu => .telugu,
+        .kannada => .kannada,
+        .malayalam => .malayalam,
+        .thai => .thai,
+        .lao => .lao,
+        .tibetan => .tibetan,
+        .myanmar => .myanmar,
+        .khmer => .khmer,
+        .han => .han,
+        .hiragana => .hiragana,
+        .katakana => .katakana,
+        .hangul => .hangul,
+        else => null,
+    };
+}
+
 /// Attr-driven font-selection bridge installed on the HarfBuzz backend by
 /// `FontSystem.shaper` (see `shape_hb.Backend.Resolver`). Only faces with a
 /// registered shaper source (eager `addFontData` bytes or a lazy
 /// `addFontSource` path) are returned, so the shaper can never be handed a
 /// database-only face.
+/// Upper bound on distinct fallback candidates `ShaperResolver.fallbackFor`
+/// will hold on the stack for one call.
+const MAX_FALLBACK_CANDIDATES: usize = 64;
+
 const ShaperResolver = struct {
     /// Resolver queries are infallible by contract (the `ShapeAdapter` vtable
     /// cannot report errors), so a `getFontMatches` OOM is mapped to "no
@@ -892,29 +936,106 @@ const ShaperResolver = struct {
         return null;
     }
 
-    /// Stateless fallback ordering: returns the (`attempt`+1)-th usable match
-    /// for `query` (0-based), so `attempt = 0` is the second usable face —
-    /// `fontFor` already offers the first as the primary. The result depends
-    /// only on `attempt` and the current usable set, never on which font
-    /// `fontFor` returned or on previous `fallbackFor` calls, so probing
-    /// attempts out of order (or after a primary retry) is well-defined.
-    /// `null` means the list is exhausted.
+    /// Fallback ordering for one candidate scan, following the phase order of
+    /// upstream `FontFallbackIter::next`:
+    ///
+    /// 1. the run's script family list, ordered by the table itself
+    ///    (`scriptFallbackUnix`, including its Han-unification routing for the
+    ///    system locale),
+    /// 2. the platform common family list,
+    /// 3. every remaining usable match in global match order.
+    ///
+    /// The primary (which `fontFor` already returned, i.e. the first usable
+    /// match in global order) is excluded, and no font is offered twice —
+    /// upstream's `seen` set — so `attempt` indexes a deduplicated candidate
+    /// list. The result depends only on `(query, script, attempt)` and the
+    /// current usable set, never on which font `fontFor` returned or on
+    /// previous `fallbackFor` calls, so probing attempts out of order (or after
+    /// a primary retry) stays well-defined and the fallback memo can key on it.
+    ///
+    /// Not yet wired: the monospace-buffer phase, which upstream ranks by
+    /// `(weight diff, non-matching codepoints in the word)`. That ranking
+    /// needs the word being shaped, and `fallbackFor` is not given it.
     fn fallbackFor(
         ctx: *anyopaque,
         query: shape_mod.FontQuery,
         script: shape_mod.Script,
         attempt: usize,
     ) ?FontId {
-        _ = script;
         const self: *FontSystem = @ptrCast(@alignCast(ctx));
         const matches = matchesFor(self, query) orelse return null;
-        var usable: usize = 0;
+
+        // Candidate ids in phase order, deduplicated (upstream's `seen` set).
+        //
+        // `fallbackFor` cannot report errors, so this uses a bounded stack
+        // buffer instead of allocating. Overflow degrades to "list exhausted",
+        // matching the OOM-as-no-match policy documented on `matchesFor`; it
+        // only happens with more than MAX_FALLBACK_CANDIDATES usable faces,
+        // where the remaining faces are increasingly unlikely to cover anything
+        // the earlier ones do not.
+        var candidates: [MAX_FALLBACK_CANDIDATES]FontId = undefined;
+        var count: usize = 0;
+        var full = false;
+
+        const offer = struct {
+            fn add(dst: []FontId, n: *usize, saturated: *bool, id: FontId) void {
+                for (dst[0..n.*]) |seen| {
+                    if (seen == id) return;
+                }
+                if (n.* == dst.len) {
+                    saturated.* = true;
+                    return;
+                }
+                dst[n.*] = id;
+                n.* += 1;
+            }
+        }.add;
+
+        // The primary, which `fontFor` already returned: the first usable match
+        // in global order. Upstream consumes it from the same iterator before
+        // the fallback loop starts, so it must never reappear as a candidate.
+        // Phase reordering means it is not necessarily `candidates[0]`, so it is
+        // identified by its global position, not by its place in the list.
+        var primary: ?FontId = null;
         for (matches) |m| {
             if (!self.canUseFontSource(m.id)) continue;
-            if (usable == attempt + 1) return m.id;
-            usable += 1;
+            primary = m.id;
+            break;
         }
-        return null;
+
+        // Phase 1: script-specific families (locale-aware, Han unification
+        // included, straight from the vendored `unix.rs` tables).
+        if (fallbackScript(script)) |fs| {
+            for (fallback.scriptFallbackUnix(fs, self.locale)) |family_name| {
+                for (matches) |m| {
+                    if (!self.canUseFontSource(m.id)) continue;
+                    if (m.id == primary) continue;
+                    const face = self.db.face(m.id) orelse continue;
+                    if (!FontDb.faceHasFamily(face, family_name)) continue;
+                    offer(&candidates, &count, &full, m.id);
+                }
+            }
+        }
+        // Phase 2: platform common families.
+        for (fallback.PLATFORM_COMMON_FALLBACK) |family_name| {
+            for (matches) |m| {
+                if (!self.canUseFontSource(m.id)) continue;
+                const face = self.db.face(m.id) orelse continue;
+                if (!FontDb.faceHasFamily(face, family_name)) continue;
+                offer(&candidates, &count, &full, m.id);
+            }
+        }
+        // Phase 3: global match order (broad coverage, no script preference).
+        for (matches) |m| {
+            if (!self.canUseFontSource(m.id)) continue;
+            if (m.id == primary) continue;
+            offer(&candidates, &count, &full, m.id);
+        }
+        if (full) return null;
+
+        // `attempt` indexes the candidate list, which already excludes the
+        // primary, so attempt 0 is the best-ranked fallback.
+        return if (attempt < count) candidates[attempt] else null;
     }
 };
 
@@ -1065,6 +1186,10 @@ pub const FontSystem = struct {
             try self.shaper_backend.?.addFont(id, bytes, index, italic_or_oblique, monospace_em_width);
         }
         if (needs_slot) self.font_ids.appendAssumeCapacity(id);
+        // Registration (and especially replacement of an existing id) changes
+        // what every font can render, so match/support caches must not outlive
+        // it. The backend clears its own shaped-run cache and fallback memo.
+        self.clearMatchesCache();
     }
 
     /// Register a font **file path** with the HarfBuzz shaping backend under
@@ -1100,6 +1225,9 @@ pub const FontSystem = struct {
             try self.shaper_backend.?.addFontSource(id, path, index, italic_or_oblique, monospaced, monospace_em_width);
         }
         if (needs_slot) self.font_ids.appendAssumeCapacity(id);
+        // See `addFontData`: match/support caches answer from font identity,
+        // which just changed.
+        self.clearMatchesCache();
     }
 
     /// Ids registered through `addFontData`/`addFontSource`, in registration
@@ -1180,6 +1308,14 @@ pub const FontSystem = struct {
         return self.shaper_backend != null;
     }
 
+    /// Drop cached font-match results.
+    ///
+    /// Also drops `support_cache`: both are keyed only by font id and match
+    /// attributes, and both answer "which faces can render this". Registering
+    /// or replacing a face therefore invalidates them together, so a face that
+    /// gains or loses coverage is never answered from a stale entry. The
+    /// shaped-run cache is handled separately by the shaper backend's own
+    /// generation (see `shape_hb.Backend.invalidateCaches`).
     pub fn clearMatchesCache(self: *FontSystem) void {
         var it = self.matches_cache.iterator();
         while (it.next()) |entry| {
@@ -1188,6 +1324,7 @@ pub const FontSystem = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.matches_cache.clearRetainingCapacity();
+        if (self.support_cache.count() != 0) self.support_cache.clearRetainingCapacity();
     }
 
     pub fn matchesCacheSize(self: *const FontSystem) usize {
@@ -1212,15 +1349,24 @@ pub const FontSystem = struct {
         return false;
     }
 
-    /// Cached font load. Real parsing (`font.zig` `Font.init`) plugs in at
-    /// the marked line; misses for unknown ids cache as null like Rust's
-    /// `or_insert_with` warning path.
+    /// Cached face-identity lookup, keyed by `(id, weight)`.
+    ///
+    /// This is **not** upstream's `FontSystem::get_font`, which returns a
+    /// live `Arc<fontdb::ID>`-resolved font object that callers shape and
+    /// rasterize through. `FontCacheEntry` carries only the id and the
+    /// requested weight, so this only answers "is there a face with this id,
+    /// and for which weight was it asked" and caches a null for unknown ids
+    /// (Rust's `or_insert_with` warning path).
+    ///
+    /// Real shaping goes through `shaper()` (`shape_hb.Backend`) and real
+    /// rasterization through `font_raster.Raster`, both of which resolve and
+    /// own the face bytes themselves. Treat this as a lookup helper, not as a
+    /// font object; code that needs a `fontdb`-equivalent font handle should
+    /// hold the bytes (`fontBytes`) and use those two backends.
     pub fn getFont(self: *FontSystem, id: FontId, weight: Weight) std.mem.Allocator.Error!?FontCacheEntry {
         const key = FontCacheKey{ .id = id, .weight = weight };
         if (self.font_cache.get(key)) |cached| return cached;
         const entry: ?FontCacheEntry = if (self.db.face(id) != null) .{
-            // C-INTEROP: replace with `font.zig` Font load
-            // (`Font.init` on the face bytes at `weight`).
             .id = id,
             .weight = weight,
         } else null;
@@ -1863,7 +2009,7 @@ test "loadFontsDir registers lazily and shaping loads only used faces" {
         .family_kind = .name,
         .family_name = "Inter",
     }) orelse return error.FontFixtureLoadFailed;
-    const glyphs = try adapter.shapeRun(alloc, inter, "Hello", false);
+    const glyphs = try adapter.shapeRun(alloc, inter, "Hello", false, &.{});
     defer alloc.free(glyphs);
     try t.expectEqual(@as(usize, 5), glyphs.len);
     for (glyphs) |g| try t.expect(g.glyph_id != 0);
@@ -2165,7 +2311,7 @@ test "fallback scan registers one face lazily and shaping loads it" {
         .family_kind = .name,
         .family_name = "Inter",
     }) orelse return error.FontFixtureLoadFailed;
-    const glyphs = try adapter.shapeRun(alloc, inter, "Hello", false);
+    const glyphs = try adapter.shapeRun(alloc, inter, "Hello", false, &.{});
     defer alloc.free(glyphs);
     try t.expectEqual(@as(usize, 5), glyphs.len);
     for (glyphs) |g| try t.expect(g.glyph_id != 0);
@@ -2313,7 +2459,7 @@ test "failed lazy source is skipped by the resolver" {
 
     // Force the broken entry's load failure. Before this, it is not known to
     // be broken; afterwards `canUseFontSource` must report it unusable.
-    try t.expectError(error.FontUnavailable, adapter.shapeRun(alloc, broken_id, "Hello", false));
+    try t.expectError(error.FontUnavailable, adapter.shapeRun(alloc, broken_id, "Hello", false, &.{}));
     try t.expect(!fs.canUseFontSource(broken_id));
     try t.expect(fs.canUseFontSource(inter_id));
     try t.expect(fs.canUseFontSource(noto_id));
@@ -2323,13 +2469,13 @@ test "failed lazy source is skipped by the resolver" {
     const query = shape_mod.FontQuery{ .family_kind = .name, .family_name = "Fam" };
     const primary = adapter.fontFor(query);
     try t.expectEqual(@as(?shape_mod.FontId, inter_id), primary);
-    const fallback = adapter.fallbackFor(query, .latin, 0);
-    try t.expectEqual(@as(?shape_mod.FontId, noto_id), fallback);
+    const fallback_candidate = adapter.fallbackFor(query, .latin, 0);
+    try t.expectEqual(@as(?shape_mod.FontId, noto_id), fallback_candidate);
     try t.expect(adapter.fallbackFor(query, .latin, 1) == null);
 
     // ...and shaping through the resolved valid face succeeds while the
     // broken source stays in the database.
-    const glyphs = try adapter.shapeRun(alloc, primary.?, "Hello", false);
+    const glyphs = try adapter.shapeRun(alloc, primary.?, "Hello", false, &.{});
     defer alloc.free(glyphs);
     try t.expectEqual(@as(usize, 5), glyphs.len);
     for (glyphs) |g| try t.expect(g.glyph_id != 0);
@@ -2362,7 +2508,7 @@ test "scanFontDir accepts a relative dir" {
     // The lazily registered relative path resolves on first shaping.
     const adapter = fs.shaper() orelse return error.FontFixtureLoadFailed;
     const id = fs.fontIds()[0];
-    const glyphs = try adapter.shapeRun(alloc, id, "Hello", false);
+    const glyphs = try adapter.shapeRun(alloc, id, "Hello", false, &.{});
     defer alloc.free(glyphs);
     try t.expectEqual(@as(usize, 5), glyphs.len);
     for (glyphs) |g| try t.expect(g.glyph_id != 0);
@@ -2571,6 +2717,7 @@ const CountingAdapter = struct {
         font: shape_mod.FontId,
         text: []const u8,
         rtl: bool,
+        features: []const shape_mod.Feature,
     ) shape_mod.ShapeError![]shape_mod.ShapedRunGlyph {
         const self = fromPtr(ptr);
         self.total_runs += 1;
@@ -2579,7 +2726,7 @@ const CountingAdapter = struct {
             self.seen[self.seen_len] = font;
             self.seen_len += 1;
         }
-        return self.inner.shapeRun(alloc, font, text, rtl);
+        return self.inner.shapeRun(alloc, font, text, rtl, features);
     }
 
     fn mapGlyph(ptr: *anyopaque, font: shape_mod.FontId, cp: u21) u16 {
@@ -2693,10 +2840,11 @@ test "fallback memo: a covering fallback is tried first for later runs" {
 
     const hebrew_word = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}"; // שלום
     try shapeMemoRun(alloc, adapter, &buf, &out, &attrs, hebrew_word);
-    // Inter misses the script; the Arabic fallback misses it too; Hebrew
-    // covers all four letters on the second fallback attempt.
-    try t.expectEqual(@as(usize, 3), counter.total_runs);
-    try t.expectEqual(@as(usize, 1), counter.count(ids.arabic));
+    // Inter misses the script. The Hebrew script phase ranks the Noto Sans
+    // Hebrew face first, so it covers all four letters on the very first
+    // fallback attempt and the Arabic face is never shaped.
+    try t.expectEqual(@as(usize, 2), counter.total_runs);
+    try t.expectEqual(@as(usize, 0), counter.count(ids.arabic));
     try t.expectEqual(@as(usize, 1), counter.count(ids.hebrew));
     for (out.items) |g| {
         try t.expect(g.glyph_id != 0);
@@ -2770,7 +2918,7 @@ test "fallback memo: a preferred miss continues the scan without retrying" {
     try t.expect(covered_by_arabic and covered_by_hebrew);
 }
 
-test "fallback memo: a script no font covers is not rescanned" {
+test "fallback memo: a script no font covers is rescanned, not negatively cached" {
     const t = std.testing;
     const alloc = t.allocator;
     const inter = try fontFixturePath(alloc, "Inter-Regular.ttf");
@@ -2805,17 +2953,18 @@ test "fallback memo: a script no font covers is not rescanned" {
 
     counter.reset();
     try shapeMemoRun(alloc, adapter, &buf, &out, &attrs, devanagari);
-    // Negative memo: attempt 0 answers null, so only the primary is shaped.
-    try t.expectEqual(@as(usize, 1), counter.total_runs);
-    try t.expectEqual(@as(usize, 0), counter.count(ids.arabic));
-    try t.expectEqual(@as(usize, 0), counter.count(ids.hebrew));
+    // Coverage is a property of the run's characters, not of its script, so a
+    // script-wide negative is never memoized: the scan runs again.
+    try t.expectEqual(@as(usize, 3), counter.total_runs);
+    try t.expectEqual(@as(usize, 1), counter.count(ids.arabic));
+    try t.expectEqual(@as(usize, 1), counter.count(ids.hebrew));
     for (out.items) |g| {
         try t.expectEqual(ids.inter, g.font_id);
         try t.expectEqual(@as(u16, 0), g.glyph_id);
     }
 }
 
-test "fallback memo: registering a covering font invalidates the negative" {
+test "fallback memo: registering a covering font is picked up without any negative to clear" {
     const t = std.testing;
     const alloc = t.allocator;
     const inter = try fontFixturePath(alloc, "Inter-Regular.ttf");
@@ -2855,18 +3004,20 @@ test "fallback memo: registering a covering font invalidates the negative" {
 
     counter.reset();
     try shapeMemoRun(alloc, adapter, &buf, &out, &attrs, arabic_word);
-    try t.expectEqual(@as(usize, 1), counter.total_runs); // negative hit
+    try t.expectEqual(@as(usize, 2), counter.total_runs); // full scan, no negative memo
 
-    // Register the missing script's face: registration must clear the memo,
-    // otherwise the negative would keep Arabic text uncovered forever.
+    // Register the missing script's face: because nothing was negatively
+    // cached, the next run simply finds it in the ordered scan.
     const arabic_id = try fs.db.addFace(arabic, 0, &.{"Noto Sans Arabic"}, "NotoSansArabic", 400, .normal, .normal, false);
     try fs.addFontSource(arabic_id, arabic, 0, false, false, null);
     fs.clearMatchesCache();
 
     counter.reset();
     try shapeMemoRun(alloc, adapter, &buf, &out, &attrs, arabic_word);
-    try t.expectEqual(@as(usize, 3), counter.total_runs);
-    try t.expectEqual(@as(usize, 1), counter.count(hebrew_id));
+    // The Arabic script phase now finds the newly registered face at attempt
+    // 0, so Hebrew is never shaped.
+    try t.expectEqual(@as(usize, 2), counter.total_runs);
+    try t.expectEqual(@as(usize, 0), counter.count(hebrew_id));
     try t.expectEqual(@as(usize, 1), counter.count(arabic_id));
     for (out.items) |g| {
         try t.expect(g.glyph_id != 0);

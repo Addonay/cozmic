@@ -76,6 +76,7 @@ const attrs_mod = @import("attrs.zig");
 const font_mod = @import("font.zig");
 const shape_mod = @import("shape.zig");
 const hb = @import("harfbuzz");
+const dynload = @import("dynload");
 
 /// Runtime HarfBuzz version string, e.g. `"14.1.0"`. Loads the shared library
 /// on first use; returns `""` when HarfBuzz cannot be loaded (the fallible
@@ -83,6 +84,41 @@ const hb = @import("harfbuzz");
 pub fn version() []const u8 {
     hb.dyn.ensureLoaded() catch return "";
     return hb.versionString();
+}
+
+/// Oldest HarfBuzz this port is expected to work with.
+///
+/// The bindings bind a fixed symbol set (see `tools/gen_dyn_bindings.py`), and
+/// `dynload` resolves every one of them at load time, so an older library that
+/// lacks any of them fails with `error.MissingSymbol` at the first use rather
+/// than here. This constant exists so an embedder can report *why* rather than
+/// only that loading failed. It is deliberately conservative and is not derived
+/// from the bindings: the set of bound entry points is the real requirement.
+pub const MINIMUM_VERSION: hb.Version = .{ .major = 1, .minor = 0, .micro = 0 };
+
+/// Whether the loaded HarfBuzz is at least `MINIMUM_VERSION`.
+///
+/// `false` when the library could not be loaded, because "cannot check" must
+/// not be reported as "meets the requirement".
+pub fn meetsMinimumVersion() bool {
+    hb.dyn.ensureLoaded() catch return false;
+    return hb.versionAtLeast(MINIMUM_VERSION);
+}
+
+/// One-shot diagnostic for a failed `Backend.init`.
+///
+/// `dynload` caches the load result for the process, so a failed load produces
+/// the same error on every later call with no new information. This turns that
+/// into a message an embedder can surface: which library was wanted, what the
+/// host reported, and (when the library loaded but a symbol was absent) which
+/// symbol. Returns `null` when the failure is not a load/bind problem, so it is
+/// safe to log unconditionally on `error.LibraryUnavailable`.
+pub fn loadFailureDiagnostic() ?[]const u8 {
+    hb.dyn.ensureLoaded() catch |err| switch (err) {
+        error.LibraryUnavailable => return "cozmic: HarfBuzz could not be loaded; install a HarfBuzz shared library (>= 1.0) and make it discoverable by the dynamic loader",
+        error.MissingSymbol => return "cozmic: the installed HarfBuzz is missing a required entry point; the port binds a fixed symbol set and needs a version that provides all of them (>= 1.0)",
+    };
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,22 +205,6 @@ pub fn collectionIndex(index: u32) u32 {
 /// `map_glyph` / `font_metrics` calls on one backend or adapter still race the
 /// shared `hb.Buffer`, `current_weight` and entry objects, and `deinit` must
 /// not run concurrently with any query.
-var lazy_load_mutex = LazyLoadMutex{};
-
-const LazyLoadMutex = struct {
-    inner: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *LazyLoadMutex) void {
-        while (!self.inner.tryLock()) {
-            std.Thread.yield() catch std.atomic.spinLoopHint();
-        }
-    }
-
-    fn unlock(self: *LazyLoadMutex) void {
-        self.inner.unlock();
-    }
-};
-
 /// Read a lazily registered font file. `Backend` has no `std.Io` parameter,
 /// so lazy loads go through the process-wide single-threaded I/O instance
 /// (serialized by `lazy_load_mutex`); callers that own a real `Io` can still
@@ -223,15 +243,12 @@ pub const FallbackMemoKey = struct {
     script: shape_mod.Script,
 };
 
-/// Memo value: first-try font and/or a trusted negative.
+/// Memo value: an advisory first-try font. Coverage failures cannot be
+/// memoized by script: fonts can cover one word and miss another in it.
 pub const FallbackMemoValue = struct {
     /// Font that most recently covered at least one missing glyph for this
     /// key; returned for attempt 0 of later runs.
     preferred: ?shape_mod.FontId = null,
-    /// No candidate covered anything while scanning this key; later attempt-0
-    /// queries answer `null` without rescanning. Never set while a
-    /// `preferred` font exists (limited trust; see `memoMaybeMarkUncovered`).
-    uncovered: bool = false,
 };
 
 /// Exact-match hash/eql (same field set as the key comparison in
@@ -288,13 +305,9 @@ pub const Backend = struct {
     /// not charge us lookups/inserts upstream never pays. Library consumers
     /// keep the default (`true`).
     run_cache_enabled: bool = true,
-    /// Transient per-fallback-resolution flags, reset when `fallback_for` is
-    /// asked for attempt 0 and consumed when the scan exhausts. Kept on the
-    /// backend so `note_fallback` and `fallback_for` share them (shaping is
-    /// single-threaded by contract; see `lazy_load_mutex`).
-    memo_run_active: bool = false,
-    memo_run_covered: bool = false,
-    memo_run_saw_note: bool = false,
+    /// Advances when registered bytes/sources or lazy-source availability
+    /// changes. FontSystem uses this to invalidate dependent Buffer caches.
+    generation: u64 = 0,
 
     /// Caller-owned font-selection callbacks (see `FontSystem.shaper`).
     pub const Resolver = struct {
@@ -311,7 +324,19 @@ pub const Backend = struct {
     /// (Re)install the font-selection bridge. The ctx pointer must stay valid
     /// for as long as the adapter is used.
     pub fn setResolver(self: *Backend, resolver: ?Resolver) void {
+        const unchanged = if (self.resolver) |old| if (resolver) |new|
+            old.ctx == new.ctx and old.font_for == new.font_for and old.fallback_for == new.fallback_for
+        else
+            false else resolver == null;
+        if (!unchanged) self.invalidateCaches();
         self.resolver = resolver;
+    }
+
+    /// Clear caches whose glyphs/selections depend on the font registry or
+    /// database. Already returned glyph slices are borrowed until this call.
+    pub fn invalidateCaches(self: *Backend) void {
+        self.clearFallbackMemo();
+        self.run_cache.clear();
     }
 
     pub fn init(allocator: std.mem.Allocator) !Backend {
@@ -397,11 +422,12 @@ pub const Backend = struct {
     /// fallback memo first: the usable candidate set changes, so previously
     /// memoized preferences/negatives may be stale (see module header).
     fn insertEntry(self: *Backend, entry: FontEntry) !void {
-        self.clearFallbackMemo();
         for (self.entries.items) |*old| {
             if (old.id == entry.id) {
+                self.invalidateCaches();
                 self.destroyEntry(old);
                 old.* = entry;
+                self.generation +%= 1;
                 return;
             }
         }
@@ -410,6 +436,8 @@ pub const Backend = struct {
             self.destroyEntry(&owned);
             return err;
         };
+        self.invalidateCaches();
+        self.generation +%= 1;
     }
 
     /// Ensure the (possibly lazy) font `id` has its HarfBuzz objects built.
@@ -429,8 +457,8 @@ pub const Backend = struct {
 
     fn ensureEntryLoaded(self: *Backend, entry: *FontEntry) shape_mod.ShapeError!void {
         if (entry.loaded) return;
-        lazy_load_mutex.lock();
-        defer lazy_load_mutex.unlock();
+        dynload.source_io_mutex.lock();
+        defer dynload.source_io_mutex.unlock();
         if (entry.loaded) return;
         // Negative cache with a single escape hatch: the first touch after a
         // persistent failure re-attempts the load, so a font file that
@@ -440,6 +468,10 @@ pub const Backend = struct {
         if (is_retry and entry.load_retried) return error.FontUnavailable;
         self.loadEntry(entry) catch |err| {
             if (isPersistentLoadFailure(err)) {
+                if (!entry.load_error) {
+                    self.invalidateCaches();
+                    self.generation +%= 1;
+                }
                 entry.load_error = true;
                 // Consume the retry only for a persistent failure; an OOM on
                 // the retry leaves `load_retried` clear so the next call can
@@ -452,7 +484,10 @@ pub const Backend = struct {
         entry.load_retried = false;
         // A source that was unusable is usable again: the candidate set
         // changed, so drop memoized selections (see module header).
-        if (is_retry) self.clearFallbackMemo();
+        if (is_retry) {
+            self.invalidateCaches();
+            self.generation +%= 1;
+        }
     }
 
     fn loadEntry(self: *Backend, entry: *FontEntry) shape_mod.ShapeError!void {
@@ -719,23 +754,6 @@ pub const Backend = struct {
     ) void {
         const entry = self.memoGetOrPut(query, script) orelse return;
         entry.preferred = font;
-        entry.uncovered = false;
-    }
-
-    /// Mark a key negative when a complete scan produced zero coverage and no
-    /// font was ever preferred. Gated on `note_fallback` having been driven so
-    /// direct `fallback_for` probing (tests, embedders) stays stateless; a key
-    /// with a `preferred` font is never marked (limited trust: the memoized
-    /// font keeps its first try and the ordered scan still runs after a miss).
-    fn memoMaybeMarkUncovered(
-        self: *Backend,
-        query: shape_mod.FontQuery,
-        script: shape_mod.Script,
-    ) void {
-        if (!(self.memo_run_active and self.memo_run_saw_note and !self.memo_run_covered)) return;
-        const entry = self.memoGetOrPut(query, script) orelse return;
-        if (entry.preferred != null) return;
-        entry.uncovered = true;
     }
 
     /// Usable index of `target` in the resolver's ordered candidate sequence
@@ -780,8 +798,8 @@ pub const Backend = struct {
         return null;
     }
 
-    /// Memoized `fallback_for`: attempt 0 returns the preferred font (or
-    /// `null` for a trusted negative); later attempts continue the resolver's
+    /// Memoized `fallback_for`: attempt 0 returns the preferred font;
+    /// later attempts continue the resolver's
     /// ordered scan with the preferred font skipped.
     fn fallbackForMemo(
         self: *Backend,
@@ -790,13 +808,7 @@ pub const Backend = struct {
         script: shape_mod.Script,
         attempt: usize,
     ) ?shape_mod.FontId {
-        if (attempt == 0) {
-            self.memo_run_active = true;
-            self.memo_run_covered = false;
-            self.memo_run_saw_note = false;
-        }
         if (self.memoGet(query, script)) |entry| {
-            if (entry.uncovered) return null;
             if (entry.preferred) |memo_font| {
                 if (!self.canUse(memo_font)) {
                     // Face became unusable: scan normally; drop the stale
@@ -812,7 +824,6 @@ pub const Backend = struct {
                     if (self.resolveSkipping(resolver, query, script, raw, memo_font)) |font| {
                         return font;
                     }
-                    self.memoMaybeMarkUncovered(query, script);
                     return null;
                 } else {
                     // The font left the candidate sequence (e.g. a load
@@ -821,9 +832,7 @@ pub const Backend = struct {
                 }
             }
         }
-        const res = resolver.fallback_for(resolver.ctx, query, script, attempt);
-        if (res == null) self.memoMaybeMarkUncovered(query, script);
-        return res;
+        return resolver.fallback_for(resolver.ctx, query, script, attempt);
     }
 
     fn entryFor(self: *Backend, font: shape_mod.FontId) *FontEntry {
@@ -897,6 +906,7 @@ fn shapeRunImpl(
     font: shape_mod.FontId,
     text: []const u8,
     rtl: bool,
+    features: []const attrs_mod.Feature,
 ) shape_mod.ShapeError![]shape_mod.ShapedRunGlyph {
     if (text.len == 0) return alloc.alloc(shape_mod.ShapedRunGlyph, 0);
     std.debug.assert(text.len <= std.math.maxInt(c_int));
@@ -908,7 +918,28 @@ fn shapeRunImpl(
     self.buffer.setDirection(if (rtl) .rtl else .ltr);
     self.buffer.addUTF8(text);
     self.buffer.guessSegmentProperties();
-    hb.shape(entry.font.?, self.buffer, null);
+    // Small feature sets are usual; keep those on the stack, preserving
+    // ordering so duplicate tags retain HarfBuzz's last-setting-wins rule.
+    var feature_buf: [16]hb.Feature = undefined;
+    const hb_features = if (features.len <= feature_buf.len)
+        feature_buf[0..features.len]
+    else
+        try alloc.alloc(hb.Feature, features.len);
+    defer if (features.len > feature_buf.len) alloc.free(hb_features);
+    for (features, hb_features) |feature, *converted| {
+        const tag = feature.tag.bytes;
+        converted.* = .{
+            .tag = hb.c.HB_TAG(tag[0], tag[1], tag[2], tag[3]),
+            .value = feature.value,
+            .start = 0,
+            .end = std.math.maxInt(c_uint),
+        };
+    }
+    // `hb_shape` with a non-empty feature array applies every feature over the
+    // whole run (our start/end are 0..max), which is what upstream passes to
+    // `shape_with_plan` (shape.rs:181-215). Passing `null` here would silently
+    // discard every requested OpenType setting.
+    hb.shape(entry.font.?, self.buffer, hb_features);
 
     const len = self.buffer.getLength();
     const infos = self.buffer.getGlyphInfos();
@@ -952,9 +983,10 @@ fn shapeRunFn(
     font: shape_mod.FontId,
     text: []const u8,
     rtl: bool,
+    features: []const attrs_mod.Feature,
 ) shape_mod.ShapeError![]shape_mod.ShapedRunGlyph {
     const self: *Backend = @ptrCast(@alignCast(ptr));
-    return shapeRunImpl(self, alloc, font, text, rtl);
+    return shapeRunImpl(self, alloc, font, text, rtl, features);
 }
 
 fn mapGlyphImpl(self: *Backend, font: shape_mod.FontId, cp: u21) u16 {
@@ -1057,9 +1089,8 @@ fn fallbackForFn(
 
 /// Fallback-memo observer: `shape.zig` reports every successful fallback
 /// shape with whether it covered a previously missing glyph. Sets the
-/// transient run flags consumed by `memoMaybeMarkUncovered` and records the
-/// covering font as preferred. A negative note also arms the run as "saw a
-/// note", so a later exhaustion can be trusted as a full zero-coverage scan.
+/// covering font as an advisory preference. A failed attempt says nothing
+/// about the font's ability to cover a later run with the same script.
 fn noteFallbackFn(
     ptr: *anyopaque,
     query: shape_mod.FontQuery,
@@ -1068,9 +1099,7 @@ fn noteFallbackFn(
     covered: bool,
 ) void {
     const self: *Backend = @ptrCast(@alignCast(ptr));
-    self.memo_run_saw_note = true;
     if (!covered) return;
-    self.memo_run_covered = true;
     self.memoNoteCovered(query, script, font);
 }
 
@@ -1087,7 +1116,7 @@ fn probePairFn(ptr: *anyopaque, font: shape_mod.FontId, c1: u21, c2: u21) shape_
     n += @as(usize, std.unicode.utf8Encode(c2, pair[n..]) catch 0);
     if (n == 0) return .{ .count = 0, .shaped_ids = .{ 0, 0 }, .charmap_ids = charmap_ids };
 
-    const shaped = shapeRunImpl(self, self.allocator, font, pair[0..n], false) catch {
+    const shaped = shapeRunImpl(self, self.allocator, font, pair[0..n], false, &.{}) catch {
         // Conservative: count < 2 makes `probeKeepsPair` keep the pair joined.
         return .{ .count = 0, .shaped_ids = .{ 0, 0 }, .charmap_ids = charmap_ids };
     };
@@ -1249,7 +1278,7 @@ test "Inter LTR: shapeRun yields 5 advancing glyphs for Hello" {
     try addFixtureFont(&backend, alloc, "Inter-Regular.ttf", shape_mod.PRIMARY_FONT_ID, false, null);
 
     const adapter = backend.adapter();
-    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(glyphs);
 
     try std.testing.expectEqual(@as(usize, 5), glyphs.len);
@@ -1304,7 +1333,7 @@ test "vendored harfbuzz wrapper: Inter Hello shapes to 5 glyphs, adapter parity"
     var backend = try Backend.init(alloc);
     defer backend.deinit();
     try addFixtureFont(&backend, alloc, "Inter-Regular.ttf", shape_mod.PRIMARY_FONT_ID, false, null);
-    const shaped = try backend.adapter().shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const shaped = try backend.adapter().shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(shaped);
     try std.testing.expectEqual(@as(usize, 5), shaped.len);
     for (shaped, infos) |glyph, info| {
@@ -1323,7 +1352,7 @@ test "NotoSansArabic RTL: contextual forms, visual order" {
     // 14.1.0: exactly 5 contextual forms (uniFE8E FE92 FEA3 FEAE FEE3), no
     // required ligature, emitted in visual order with byte clusters 8..0.
     const text = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}";
-    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, text, true);
+    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, text, true, &.{});
     defer alloc.free(glyphs);
 
     try std.testing.expectEqual(@as(usize, 5), glyphs.len);
@@ -1379,7 +1408,7 @@ test "InterVariable: wght 900 shapes wider than wght 400" {
     const text = "Hamburgefonstiv";
 
     adapter.setWeight(400);
-    const regular = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, text, false);
+    const regular = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, text, false, &.{});
     defer alloc.free(regular);
     var regular_total: f32 = 0;
     try std.testing.expect(regular.len > 0);
@@ -1389,7 +1418,7 @@ test "InterVariable: wght 900 shapes wider than wght 400" {
     }
 
     adapter.setWeight(900);
-    const black = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, text, false);
+    const black = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, text, false, &.{});
     defer alloc.free(black);
     var black_total: f32 = 0;
     try std.testing.expect(black.len > 0);
@@ -1478,7 +1507,7 @@ test "lazy addFontSource: no load at registration, loaded on first shape" {
 
     // First shape loads exactly that face.
     const adapter = backend.adapter();
-    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(glyphs);
     try std.testing.expectEqual(@as(usize, 5), glyphs.len);
     for (glyphs) |g| try std.testing.expect(g.glyph_id != 0);
@@ -1513,7 +1542,7 @@ test "lazy addFontSource failure: FontUnavailable, zero queries, negative cache"
     // Shaping is the only fallible query; it reports the missing source.
     try std.testing.expectError(
         error.FontUnavailable,
-        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false),
+        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{}),
     );
     // The failure is cached and the source is now known-unusable.
     try std.testing.expect(backend.entries.items[0].load_error);
@@ -1535,7 +1564,7 @@ test "lazy addFontSource failure: FontUnavailable, zero queries, negative cache"
     // loads the entry. The retry flag blocks every later unbounded retry.
     try std.testing.expectError(
         error.FontUnavailable,
-        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false),
+        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{}),
     );
     try std.testing.expectEqual(@as(usize, 0), backend.loadedCount());
     try std.testing.expect(backend.entries.items[0].load_error);
@@ -1563,7 +1592,7 @@ test "lazy load failure retries once and recovers when the file reappears" {
 
     try std.testing.expectError(
         error.FontUnavailable,
-        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false),
+        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{}),
     );
     try std.testing.expect(backend.entries.items[0].load_error);
     try std.testing.expect(!backend.canUse(shape_mod.PRIMARY_FONT_ID));
@@ -1574,7 +1603,7 @@ test "lazy load failure retries once and recovers when the file reappears" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "reappears.ttf", .data = bytes });
 
     // The next touch retries once and recovers, clearing both flags.
-    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(glyphs);
     try std.testing.expectEqual(@as(usize, 5), glyphs.len);
     for (glyphs) |g| try std.testing.expect(g.glyph_id != 0);
@@ -1605,7 +1634,7 @@ test "lazy load OOM is transient and not cached as a permanent failure" {
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(
         error.OutOfMemory,
-        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false),
+        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{}),
     );
     const entry = &backend.entries.items[0];
     // OOM must not poison the entry: no negative cache, still usable.
@@ -1615,7 +1644,7 @@ test "lazy load OOM is transient and not cached as a permanent failure" {
 
     // Once allocations succeed again, the very next call retries and loads.
     failing.fail_index = std.math.maxInt(usize);
-    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(glyphs);
     try std.testing.expectEqual(@as(usize, 5), glyphs.len);
     for (glyphs) |g| try std.testing.expect(g.glyph_id != 0);
@@ -1639,7 +1668,7 @@ test "replacing a loaded lazy entry frees the old face and reloads" {
     try backend.addFontSource(shape_mod.PRIMARY_FONT_ID, path_a, 0, false, false, null);
     const adapter = backend.adapter();
 
-    const first = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const first = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(first);
     try std.testing.expectEqual(@as(usize, 5), first.len);
     try std.testing.expectEqual(@as(usize, 1), backend.loadedCount());
@@ -1652,7 +1681,7 @@ test "replacing a loaded lazy entry frees the old face and reloads" {
     try std.testing.expectEqual(@as(usize, 0), backend.loadedCount());
     try std.testing.expectEqualStrings(path_b, backend.sourcePath(shape_mod.PRIMARY_FONT_ID).?);
 
-    const second = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const second = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(second);
     try std.testing.expectEqual(@as(usize, 5), second.len);
     for (second) |g| try std.testing.expect(g.glyph_id != 0);
@@ -1678,7 +1707,7 @@ test "replacing a loaded lazy entry frees the old face and reloads" {
     try std.testing.expectEqual(@as(usize, 1), backend.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), backend.loadedCount());
     try std.testing.expect(backend.sourcePath(shape_mod.PRIMARY_FONT_ID) == null);
-    const third = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const third = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(third);
     try std.testing.expectEqual(@as(usize, 5), third.len);
     for (third) |g| try std.testing.expect(g.glyph_id != 0);
@@ -1706,7 +1735,7 @@ test "packed fontconfig index masks to the collection face for HarfBuzz" {
     // The packed index must select collection face 2 (not 0x10002).
     try backend.addFont(shape_mod.PRIMARY_FONT_ID, ttc, 0x0001_0002, false, null);
     try std.testing.expect(backend.entries.items[0].upem > 0);
-    const glyphs = try backend.adapter().shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const glyphs = try backend.adapter().shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(glyphs);
     try std.testing.expectEqual(@as(usize, 5), glyphs.len);
     for (glyphs) |g| {
@@ -1741,7 +1770,7 @@ test "OOM on the post-failure retry does not permanently poison the entry" {
     // single retry available.
     try std.testing.expectError(
         error.FontUnavailable,
-        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false),
+        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{}),
     );
     const entry = &backend.entries.items[0];
     try std.testing.expect(entry.load_error);
@@ -1756,7 +1785,7 @@ test "OOM on the post-failure retry does not permanently poison the entry" {
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(
         error.OutOfMemory,
-        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false),
+        adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{}),
     );
     try std.testing.expect(entry.load_error);
     try std.testing.expect(!entry.load_retried);
@@ -1766,7 +1795,7 @@ test "OOM on the post-failure retry does not permanently poison the entry" {
 
     // 3. Allocations work again: the next call retries and loads.
     failing.fail_index = std.math.maxInt(usize);
-    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false);
+    const glyphs = try adapter.shapeRun(alloc, shape_mod.PRIMARY_FONT_ID, "Hello", false, &.{});
     defer alloc.free(glyphs);
     try std.testing.expectEqual(@as(usize, 5), glyphs.len);
     for (glyphs) |g| try std.testing.expect(g.glyph_id != 0);

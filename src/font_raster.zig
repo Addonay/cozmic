@@ -34,12 +34,14 @@
 //!   thread, or serialize access externally. Independent `Raster`s may run on
 //!   different threads; the one piece of process-wide state they share is the
 //!   single-threaded `std.Io.Threaded.global_single_threaded` instance used by
-//!   lazy reads, which is serialized by the module-level `lazyReadMutex`.
+//!   lazy reads, which is serialized by `dynload.source_io_mutex` across both
+//!   native shaping and raster backends.
 
 const std = @import("std");
 const raster_ft = @import("raster_ft.zig");
 const glyph_cache = @import("glyph_cache.zig");
 const font_system = @import("font_system.zig");
+const dynload = @import("dynload");
 /// Outline command type (type-only back-reference; `swash_cache` imports this
 /// file for the `Raster` field, and neither layout depends on the other —
 /// Zig resolves the accepted cycle, see raster_ft.zig).
@@ -94,44 +96,14 @@ pub const FaceEntry = struct {
     }
 };
 
-/// Minimal mutual-exclusion lock for the process-wide lazy-read guard.
-///
-/// `dynload.Mutex` cannot be reused here: `dynload.zig` is the root of a
-/// separate module, and importing that file into the cozmic module is rejected
-/// ("file exists in modules 'cozmic' and 'dynload'"). Zig 0.17 has no
-/// `std.Thread.Mutex`, and `std.Io.Mutex` needs an `Io` this module does not
-/// own, so this is the same CAS-plus-yield lock `dynload` uses; contention
-/// only happens while a font file is read.
-const SpinMutex = struct {
-    inner: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *SpinMutex) void {
-        while (!self.inner.tryLock()) {
-            std.Thread.yield() catch std.atomic.spinLoopHint();
-        }
-    }
-
-    fn unlock(self: *SpinMutex) void {
-        self.inner.unlock();
-    }
-};
-
-/// Process-wide lock for lazy source reads.
-///
-/// `Raster` has no `std.Io` parameter, so lazy loads go through the
-/// process-wide single-threaded I/O instance; that instance is shared by every
-/// `Raster`, so two independent rasters loading files on different threads
-/// would race inside it without this lock.
-var lazyReadMutex: SpinMutex = .{};
-
 /// Read a lazily registered font file. `Raster` has no `std.Io` parameter, so
 /// lazy loads go through the process-wide single-threaded I/O instance;
 /// callers that own a real `Io` can still register bytes eagerly. The read is
-/// serialized against other rasters by `lazyReadMutex`; the per-raster state
-/// (entries, `FT_Face`s) is still single-threaded by contract.
+/// serialized against shapers and rasters by the shared source I/O mutex;
+/// per-raster state (entries, `FT_Face`s) is still single-threaded by contract.
 fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    lazyReadMutex.lock();
-    defer lazyReadMutex.unlock();
+    dynload.source_io_mutex.lock();
+    defer dynload.source_io_mutex.unlock();
     return std.Io.Dir.cwd().readFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         path,
@@ -145,6 +117,10 @@ pub const Raster = struct {
     allocator: std.mem.Allocator,
     library: raster_ft.Library,
     faces: std.ArrayList(FaceEntry) = .empty,
+    /// Changes after each successful registration/replacement. Glyph cache
+    /// keys contain font ids, so consumers also track this revision to avoid
+    /// retaining images or outlines from a previous font at the same id.
+    generation: u64 = 0,
 
     /// Create an empty registry. `deinit` must be called exactly once.
     pub fn init(allocator: std.mem.Allocator) !Raster {
@@ -194,6 +170,7 @@ pub const Raster = struct {
             if (old.font_id == entry.font_id) {
                 old.destroy(self.allocator);
                 old.* = entry;
+                self.generation +%= 1;
                 return;
             }
         }
@@ -202,6 +179,7 @@ pub const Raster = struct {
             owned.destroy(self.allocator);
             return err;
         };
+        self.generation +%= 1;
     }
 
     /// Register every id in `ids` from `fs`: eager bytes when the font was
@@ -307,6 +285,20 @@ pub const Raster = struct {
 
     /// Number of registered faces whose bytes are loaded (eager registrations
     /// plus lazy ones already touched). Test/consumer introspection.
+    /// Runtime FreeType version, or `null` when it cannot be read.
+    pub fn libraryVersion(self: *const Raster) ?raster_ft.Library.Version {
+        return self.library.version();
+    }
+
+    /// Whether the loaded FreeType is at least `MINIMUM_VERSION`.
+    ///
+    /// `false` when the version cannot be read, because "cannot check" must not
+    /// be reported as "meets the requirement".
+    pub fn meetsMinimumVersion(self: *const Raster) bool {
+        const v = self.library.version() orelse return false;
+        return compareVersions(v, MINIMUM_VERSION) != .lt;
+    }
+
     pub fn loadedCount(self: *const Raster) usize {
         var count: usize = 0;
         for (self.faces.items) |*entry| {
@@ -457,6 +449,34 @@ pub const Raster = struct {
 /// Round `font_size` to the nearest whole pixel and clamp to
 /// `[1, maxInt(u16)]`; NaN maps to the minimum. FreeType's
 /// `FT_Set_Pixel_Sizes` rejects zero, so the floor is load-bearing.
+/// Oldest FreeType this port is expected to work with.
+///
+/// As with HarfBuzz, the real requirement is the bound symbol set rather than
+/// this number; it exists so an embedder can explain a load failure instead of
+/// only seeing `error.LibraryUnavailable` repeated.
+pub const MINIMUM_VERSION: raster_ft.Library.Version = .{ .major = 2, .minor = 10, .patch = 0 };
+
+/// Three-way compare of two versions.
+pub fn compareVersions(a: raster_ft.Library.Version, b: raster_ft.Library.Version) std.math.Order {
+    if (a.major != b.major) return std.math.order(a.major, b.major);
+    if (a.minor != b.minor) return std.math.order(a.minor, b.minor);
+    return std.math.order(a.patch, b.patch);
+}
+
+/// One-shot diagnostic for a failed `Raster.init` / `Library.init`.
+///
+/// The dynamic loader caches its result for the process, so a failed load
+/// repeats the same bare error forever with no explanation. Returns `null`
+/// when the library actually loaded (so the failure was elsewhere) or on OOM.
+pub fn loadFailureDiagnostic() ?[]const u8 {
+    var lib = raster_ft.Library.init() catch |err| switch (err) {
+        error.LibraryUnavailable => return "cozmic: FreeType could not be loaded; install a FreeType shared library (>= 2.10) and make it discoverable by the dynamic loader",
+        else => return null,
+    };
+    defer lib.deinit();
+    return null;
+}
+
 pub fn pixelSize(font_size: f32) u16 {
     if (std.math.isNan(font_size)) return 1;
     const rounded = @round(font_size);
@@ -1103,7 +1123,7 @@ test "addFromFontSystem skips known-failed lazy sources" {
     const adapter = fs.shaper() orelse return error.TestUnexpectedResult;
     try testing.expectError(
         error.FontUnavailable,
-        adapter.shapeRun(allocator, broken_id, "A", false),
+        adapter.shapeRun(allocator, broken_id, "A", false, &.{}),
     );
     try testing.expect(!fs.canUseFontSource(broken_id));
     try testing.expect(fs.fontSourcePath(broken_id) != null);
@@ -1144,7 +1164,7 @@ test "addFromFontSystem migrates valid ids around a failed lazy source" {
     const adapter = fs.shaper() orelse return error.TestUnexpectedResult;
     try testing.expectError(
         error.FontUnavailable,
-        adapter.shapeRun(allocator, broken_id, "A", false),
+        adapter.shapeRun(allocator, broken_id, "A", false, &.{}),
     );
     try testing.expect(!fs.canUseFontSource(broken_id));
     try testing.expect(fs.fontSourcePath(broken_id) != null);

@@ -2,9 +2,9 @@
 //!
 //! `CacheKey` / `SubpixelBin` / `CacheKeyFlags` are unified with
 //! `glyph_cache.zig` (same `CacheKey` Rust uses in `swash.rs:13` via
-//! `crate::{CacheKey, CacheKeyFlags}`). `Color` / image types stay local
-//! until the font modules unify (see TODO below).
-//! TODO(swash): unify `Color` with the real attrs/cache modules.
+//! `crate::{CacheKey, CacheKeyFlags}`). The pixel-callback `Color` is the
+//! canonical `attrs.Color` (`0xAARRGGBB`), so mask and color images are
+//! interpreted identically by every consumer.
 //!
 //! Verbatim behaviour preserved:
 //! - Source order `ColorOutline(0) / ColorBitmap(BestFit) / Outline`
@@ -15,7 +15,9 @@
 //! - `wght` is clamped to the variation range before use (swash.rs:38-43).
 //! - `with_pixels` blends `Mask` as `(alpha << 24) | (base & 0xFF_FF_FF)` and
 //!   expands `Color` as RGBA; `SubpixelMask` is explicitly skipped and
-//!   reported (swash.rs:203-246).
+//!   reported (swash.rs:203-246). Both branches emit the canonical
+//!   `attrs.Color` `0xAARRGGBB` packing, so a color-font pixel and a mask
+//!   pixel are interpreted identically by every consumer.
 //! - Both caches use negative caching: misses (`null`) are stored so the
 //!   rasterizer is not re-invoked (via `HashMap.entry` / `or_insert_with` in
 //!   swash.rs:169-183). One exception when a real `Raster` is attached: a
@@ -33,7 +35,7 @@
 //!   `.color` images; LCD/LCD_V (subpixel) stay explicitly skipped, matching
 //!   upstream's `SubpixelMask` TODO.
 //!
-//! WIRING POINT (`hb`/`swash` backend): `RasterAdapter` is the narrow adapter
+//! `RasterAdapter` is the narrow adapter
 //! interface standing in for `swash::scale::ScaleContext` + `FontRef`. The
 //! bundled `FallbackRaster` is a pure-Zig stand-in that synthesizes a solid
 //! mask. The real scaler is `font_raster.Raster` (FreeType): attach one with
@@ -46,6 +48,7 @@
 //! `Raster.canUse` and `renderImage`).
 
 const std = @import("std");
+const attrs = @import("attrs.zig");
 const glyph_cache = @import("glyph_cache.zig");
 const font_raster = @import("font_raster.zig");
 const raster_ft = @import("raster_ft.zig");
@@ -60,13 +63,18 @@ pub const FLAG_FAKE_ITALIC: CacheKeyFlags = CacheKeyFlags.FAKE_ITALIC;
 pub const FLAG_DISABLE_HINTING: CacheKeyFlags = CacheKeyFlags.DISABLE_HINTING;
 pub const FLAG_PIXEL_FONT: CacheKeyFlags = CacheKeyFlags.PIXEL_FONT;
 
-/// RGBA color packed as `u32` (matches cosmic-text `Color` layout `0xRRGGBBAA`).
-/// Local alias only; unify with `attrs.zig` later.
-pub const Color = u32;
+/// Packed color handed to `PixelFn` and used for the `base` text color.
+///
+/// Canonical `attrs.Color` (`0xAARRGGBB`), the same type `layout`/`render` use.
+/// The pixel callback ABI previously used a local `0xRRGGBBAA` `u32` alias for
+/// the color-image branch while the mask branch used the alpha-high layout,
+/// so the same `u32` meant two different things depending on image content and
+/// `LegacyRenderer` reinterpreted color-font pixels as the wrong channels.
+pub const Color = attrs.Color;
 
-/// Pack RGBA bytes, matching `Color::rgba` in cosmic-text.
+/// Pack RGBA bytes into the canonical `attrs.Color` layout (`0xAARRGGBB`).
 pub fn rgba(r: u8, g: u8, b: u8, a: u8) Color {
-    return (@as(u32, r) << 24) | (@as(u32, g) << 16) | (@as(u32, b) << 8) | @as(u32, a);
+    return attrs.Color.rgba(r, g, b, a);
 }
 
 /// Raster cache key (canonical owner: `glyph_cache.CacheKey`).
@@ -185,7 +193,7 @@ pub const OutlineCommand = union(enum) {
 };
 
 /// Narrow adapter interface standing in for `ScaleContext + FontRef`
-/// (see module docs WIRING POINT). Implementations must honour `SOURCE_ORDER`
+/// (see the module header). Implementations must honour `SOURCE_ORDER`
 /// and apply `FAKE_ITALIC` / `PIXEL_FONT` / `wght` clamping as documented
 /// above. Returning `null` records a negative-cache entry (an adapter has no
 /// way to distinguish a missing glyph from a failed source; only the real
@@ -275,6 +283,17 @@ pub const SwashCache = struct {
     raster: ?*font_raster.Raster = null,
     image_cache: std.HashMap(CacheKey, ?SwashImageOwned, KeyContext, 80),
     outline_cache: std.HashMap(CacheKey, ?[]OutlineCommand, KeyContext, 80),
+    /// `Raster.generation` observed when the caches were last cleared.
+    ///
+    /// `CacheKey` contains a font id but no font identity, so replacing the
+    /// bytes registered for an id keeps every key valid while the cached
+    /// pixels and outline commands belong to the previous face. Caching the
+    /// producer's generation makes that same-pointer update visible: on the
+    /// next lookup the generation differs and both caches drop.
+    ///
+    /// `null` while no raster is attached, in which case the stand-in adapter
+    /// is the only producer and cannot change without `setRaster`.
+    raster_generation: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, adapter: ?RasterAdapter) SwashCache {
         return .{
@@ -288,30 +307,59 @@ pub const SwashCache = struct {
     pub fn deinit(self: *SwashCache) void {
         self.clearImages();
         self.image_cache.deinit();
-        var oit = self.outline_cache.iterator();
-        while (oit.next()) |entry| {
-            if (entry.value_ptr.*) |cmds| self.allocator.free(cmds);
-        }
+        self.clearOutlines();
         self.outline_cache.deinit();
     }
 
     /// Attach (or detach with `null`) the real FreeType raster.
     ///
-    /// Cached images are dropped: `CacheKey` does not record the raster source,
-    /// so keeping them would serve stand-in pixels after a real backend is
-    /// attached (or vice versa). Outline caching is unaffected.
+    /// Both caches are dropped. `CacheKey` records neither the raster producer
+    /// nor the font identity, so keeping either cache would serve outlines
+    /// (or pixels) produced by the backend that was just replaced.
     pub fn setRaster(self: *SwashCache, raster: ?*font_raster.Raster) void {
         if (self.raster == raster) return;
         self.raster = raster;
-        self.clearImages();
+        self.raster_generation = if (raster) |r| r.generation else null;
+        self.clearProducerCaches();
     }
 
-    fn clearImages(self: *SwashCache) void {
+    /// Drop every cached image and outline command.
+    ///
+    /// Callers holding an `Outlines`/`SwashImageView` slice keep borrowing it
+    /// until this call, matching the `getImage`/`getOutline` documented
+    /// lifetimes. Use `invalidateImages` when only pixels changed.
+    pub fn clearProducerCaches(self: *SwashCache) void {
+        self.clearImages();
+        self.clearOutlines();
+    }
+
+    /// Drop every cached image while keeping cached outlines. Borrowed image
+    /// views stay valid until this call.
+    pub fn clearImages(self: *SwashCache) void {
         var it = self.image_cache.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.*) |*img| img.free(self.allocator);
         }
         self.image_cache.clearRetainingCapacity();
+    }
+
+    /// Drop every cached outline command while keeping cached images. Borrowed
+    /// outline slices stay valid until this call.
+    pub fn clearOutlines(self: *SwashCache) void {
+        var it = self.outline_cache.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*) |cmds| self.allocator.free(cmds);
+        }
+        self.outline_cache.clearRetainingCapacity();
+    }
+
+    /// Drop both caches if the attached raster has been re-registered since
+    /// the last check. A no-op with no raster attached.
+    fn syncRasterGeneration(self: *SwashCache) void {
+        const raster = self.raster orelse return;
+        if (self.raster_generation != null and self.raster_generation.? == raster.generation) return;
+        self.raster_generation = raster.generation;
+        self.clearProducerCaches();
     }
 
     /// Render one image from whichever source is attached: FreeType raster
@@ -362,6 +410,7 @@ pub const SwashCache = struct {
     /// key insertion is removed by the `errdefer` below, so
     /// `error.OutOfMemory` and `error.FontUnavailable` never poison the cache.
     pub fn getImage(self: *SwashCache, key: CacheKey) !?SwashImageView {
+        self.syncRasterGeneration();
         const entry = try self.image_cache.getOrPut(key);
         if (!entry.found_existing) {
             // The key is inserted before rendering; remove it again if
@@ -410,6 +459,7 @@ pub const SwashCache = struct {
     /// Create outline commands, caching results including misses
     /// (swash.rs:175-184).
     pub fn getOutline(self: *SwashCache, key: CacheKey) !?[]const OutlineCommand {
+        self.syncRasterGeneration();
         const entry = try self.outline_cache.getOrPut(key);
         if (!entry.found_existing) {
             // Same error-path hygiene as `getImage`.
@@ -451,6 +501,11 @@ pub const SwashCache = struct {
         switch (view.content) {
             .mask => {
                 // swash.rs:208-221: `Color((alpha << 24) | base & 0xFF_FF_FF)`.
+                // In canonical `0xAARRGGBB` terms: replace the base alpha with
+                // this pixel's coverage, keep the base RGB. Upstream inherits
+                // swash's TODO here and ignores base alpha entirely; see the
+                // module header for the deliberate difference.
+                const base_rgb = base.value & 0x00FF_FFFF;
                 var i: usize = 0;
                 var count: usize = 0;
                 var off_y: i32 = 0;
@@ -459,7 +514,7 @@ pub const SwashCache = struct {
                     while (off_x < w) : (off_x += 1) {
                         if (i >= view.data.len) return count;
                         const alpha = view.data[i];
-                        visit(ctx, ox + off_x, oy + off_y, (@as(u32, alpha) << 24) | (base & 0x00FF_FFFF));
+                        visit(ctx, ox + off_x, oy + off_y, .{ .value = (@as(u32, alpha) << 24) | base_rgb });
                         i += 1;
                         count += 1;
                     }
@@ -467,7 +522,9 @@ pub const SwashCache = struct {
                 return count;
             },
             .color => {
-                // swash.rs:222-240: RGBA bytes straight through.
+                // swash.rs:222-240: RGBA bytes straight through, packed with
+                // the canonical `attrs.Color` layout like every other color in
+                // the pipeline.
                 var i: usize = 0;
                 var count: usize = 0;
                 var off_y: i32 = 0;
@@ -664,14 +721,15 @@ test "mask pixels blend alpha over base verbatim" {
     defer col.xs.deinit(col.alloc);
     defer col.ys.deinit(col.alloc);
     defer col.colors.deinit(col.alloc);
-    const base: Color = 0x11223344;
+    const base: Color = .{ .value = 0x11223344 };
     const n = try cache.withPixels(key, base, &col, PixelCollector.visit);
     try std.testing.expectEqual(@as(usize, 2), n);
     // Origin is (left, -top) = (10, -4).
     try std.testing.expectEqual(@as(i32, 10), col.xs.items[0]);
     try std.testing.expectEqual(@as(i32, -4), col.ys.items[0]);
-    try std.testing.expectEqual((@as(u32, 0xFF) << 24) | (base & 0x00FF_FFFF), col.colors.items[0]);
-    try std.testing.expectEqual((@as(u32, 0x80) << 24) | (base & 0x00FF_FFFF), col.colors.items[1]);
+    // Canonical 0xAARRGGBB: coverage replaces the base alpha, RGB survives.
+    try std.testing.expectEqual(Color.rgba(0x22, 0x33, 0x44, 0xFF), col.colors.items[0]);
+    try std.testing.expectEqual(Color.rgba(0x22, 0x33, 0x44, 0x80), col.colors.items[1]);
 }
 
 test "color pixels expand RGBA bytes" {
@@ -689,7 +747,7 @@ test "color pixels expand RGBA bytes" {
     defer col.xs.deinit(col.alloc);
     defer col.ys.deinit(col.alloc);
     defer col.colors.deinit(col.alloc);
-    const n = try cache.withPixels(key, 0, &col, PixelCollector.visit);
+    const n = try cache.withPixels(key, Color{ .value = 0 }, &col, PixelCollector.visit);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(rgba(1, 2, 3, 4), col.colors.items[0]);
 }
@@ -734,7 +792,7 @@ test "imageFromRendered converts premultiplied BGRA to straight RGBA" {
     defer col.xs.deinit(std.testing.allocator);
     defer col.ys.deinit(std.testing.allocator);
     defer col.colors.deinit(std.testing.allocator);
-    const n = try cache.withPixels(key, 0, &col, PixelCollector.visit);
+    const n = try cache.withPixels(key, Color{ .value = 0 }, &col, PixelCollector.visit);
     try std.testing.expectEqual(@as(usize, 4), n);
     try std.testing.expectEqual(@as(i32, -1), col.xs.items[0]);
     try std.testing.expectEqual(@as(i32, -3), col.ys.items[0]);
@@ -746,10 +804,7 @@ test "imageFromRendered converts premultiplied BGRA to straight RGBA" {
     // mask path which keeps `base`'s RGB and only varies alpha.
     var non_gray: usize = 0;
     for (col.colors.items) |c| {
-        const r: u8 = @intCast((c >> 24) & 0xFF);
-        const g: u8 = @intCast((c >> 16) & 0xFF);
-        const b: u8 = @intCast((c >> 8) & 0xFF);
-        if (r != g or g != b) non_gray += 1;
+        if (c.r() != c.g() or c.g() != c.b()) non_gray += 1;
     }
     try std.testing.expect(non_gray >= 2);
 }
@@ -1009,11 +1064,11 @@ test "raster-backed withPixels emits real FreeType coverage" {
     defer col.xs.deinit(allocator);
     defer col.ys.deinit(allocator);
     defer col.colors.deinit(allocator);
-    const n = try cache.withPixels(key, 0, &col, PixelCollector.visit);
+    const n = try cache.withPixels(key, Color{ .value = 0 }, &col, PixelCollector.visit);
     try std.testing.expectEqual(view.data.len, n);
     var opaque_count: usize = 0;
     for (col.colors.items) |color| {
-        if ((color >> 24) != 0) opaque_count += 1;
+        if (color.a() != 0) opaque_count += 1;
     }
     try std.testing.expect(opaque_count > 0);
 
@@ -1267,14 +1322,13 @@ test "raster-backed color font serves a .color image with non-zero alpha" {
     defer col.xs.deinit(allocator);
     defer col.ys.deinit(allocator);
     defer col.colors.deinit(allocator);
-    const n = try cache.withPixels(key, 0, &col, PixelCollector.visit);
+    const n = try cache.withPixels(key, Color{ .value = 0 }, &col, PixelCollector.visit);
     try std.testing.expectEqual(view.data.len / 4, n);
+    // Component extraction goes through the canonical accessors, so this
+    // assertion would fail under the old 0xRRGGBBAA packing.
     var non_gray: usize = 0;
     for (col.colors.items) |c| {
-        const r: u8 = @intCast((c >> 24) & 0xFF);
-        const g: u8 = @intCast((c >> 16) & 0xFF);
-        const b: u8 = @intCast((c >> 8) & 0xFF);
-        if (r != g or g != b) non_gray += 1;
+        if (c.r() != c.g() or c.g() != c.b()) non_gray += 1;
     }
     try std.testing.expect(non_gray > 0);
 }

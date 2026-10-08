@@ -168,7 +168,7 @@ pub const LegacyRenderer = struct {
         self.glyph_y = physical_glyph.y;
         _ = self.cache.withPixels(
             physical_glyph.cache_key,
-            color.value,
+            color,
             @ptrCast(self),
             pixel,
         ) catch {
@@ -176,7 +176,7 @@ pub const LegacyRenderer = struct {
         };
     }
 
-    fn pixel(ctx: *anyopaque, x: i32, y: i32, color: u32) void {
+    fn pixel(ctx: *anyopaque, x: i32, y: i32, color: Color) void {
         const self: *LegacyRenderer = @ptrCast(@alignCast(ctx));
         self.callback.call(
             self.callback.ctx,
@@ -184,7 +184,7 @@ pub const LegacyRenderer = struct {
             self.glyph_y + y,
             1,
             1,
-            .{ .value = color },
+            color,
         );
     }
 };

@@ -461,7 +461,24 @@ pub const Metrics = struct {
     pub fn eql(self: Metrics, other: Metrics) bool {
         return self.font_size == other.font_size and self.line_height == other.line_height;
     }
+
+    /// Whether these metrics are usable for layout.
+    ///
+    /// Both fields must be finite and strictly positive. A zero or negative
+    /// size produces degenerate glyph scaling, and a NaN or infinite value
+    /// poisons every downstream sum, comparison and cache key rather than
+    /// failing at a single boundary. Rejecting them here keeps
+    /// "returns an error, never traps" a property of the public API instead of
+    /// something that merely happens to hold for the inputs tried so far.
+    pub fn isValid(self: Metrics) bool {
+        return isFinitePositive(self.font_size) and isFinitePositive(self.line_height);
+    }
 };
+
+/// True when `v` is neither NaN/infinite nor `<= 0`.
+pub fn isFinitePositive(v: f32) bool {
+    return std.math.isFinite(v) and v > 0;
+}
 
 /// Metrics, but storing the `u32` bit patterns of the floats so the value
 /// implements `eql()` and `hash()`.

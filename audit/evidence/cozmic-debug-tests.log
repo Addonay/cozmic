@@ -1,0 +1,20 @@
+src/freetype/c_bindings_dyn.zig: up to date (26 required symbols, 344 declarations)
+src/harfbuzz/c_bindings_dyn.zig: up to date (46 required symbols, 731 declarations, 3 optional/excluded)
+Build Summary: 12/12 steps succeeded; 414/417 tests passed (3 skipped)
+test success
++- run test 361 pass, 3 skip (364 total) 917ms MaxRSS:21M
+|  +- compile test debug native success 9s MaxRSS:273M
+|     +- options cached
+|     +- options cached
++- run test 2 pass (2 total) 23ms MaxRSS:6M
+|  +- compile test debug native success 7s MaxRSS:189M
+|     +- options (reused)
+|     +- options (reused)
++- check-bindings success
+|  +- run python3 success 269ms
+|  +- run python3 success 435ms
++- run test 51 pass (51 total) 2m MaxRSS:27M
+   +- compile test debug native success 8s MaxRSS:334M
+      +- options (reused)
+      +- options (reused)
+

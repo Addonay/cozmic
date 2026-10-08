@@ -213,6 +213,24 @@ pub fn build(b: *std.Build) void {
     run_upstream_tests.setCwd(b.path("."));
     test_step.dependOn(&run_upstream_tests.step);
 
+    // `zig build audit` runs only the COZMIC_AUDIT.md regression module, so an
+    // audit-tracking run stays cheap and its result is unambiguous. The same
+    // module is part of `tests/all.zig`, so `zig build test` covers it too.
+    // The audit's original diagnostic witnesses (which asserted each defect
+    // *was* present) were removed once the defects were fixed; their
+    // reproductions and the pre-fix numbers live in that module's comments.
+    const audit_mod = b.createModule(.{
+        .root_source_file = b.path("tests/audit_regressions.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "cozmic", .module = mod }},
+    });
+    audit_mod.link_libc = true;
+    const audit_tests = b.addTest(.{ .root_module = audit_mod });
+    const audit_run = b.addRunArtifact(audit_tests);
+    audit_run.setCwd(b.path("."));
+    b.step("audit", "Run the COZMIC_AUDIT.md regression assertions").dependOn(&audit_run.step);
+
     const bench_opts = b.addOptions();
     bench_opts.addOption(bool, "vi", enable_vi);
     bench_opts.addOption(bool, "syntect", enable_syntect);
@@ -240,6 +258,17 @@ pub fn build(b: *std.Build) void {
         bench_ezi,
         false,
     );
+
+    const matched_mod = b.createModule(.{
+        .root_source_file = b.path("audit/matched_bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{.{ .name = "cozmic", .module = bench_core }},
+    });
+    const matched_exe = b.addExecutable(.{ .name = "audit-matched", .root_module = matched_mod });
+    const matched_run = b.addRunArtifact(matched_exe);
+    matched_run.setCwd(b.path("."));
+    b.step("audit-bench", "Run matched cold-shaping audit workloads").dependOn(&matched_run.step);
 
     // `zig build bench -- [--format json] [--quick] [--iter N] [--warmup N]`
     const bench_step = b.step("bench", "Run benchmarks (-- --quick for a fast harness smoke run)");
@@ -365,6 +394,12 @@ fn createCozmicGraph(
             .{ .name = "ezi_unicode", .module = ezi.module("unicode") },
             .{ .name = "harfbuzz", .module = harfbuzz_mod },
             .{ .name = "freetype", .module = freetype_mod },
+            // Direct access to the shared runtime loader. The native backends
+            // (`shape_hb`, `font_raster`) serialize their lazy font-file reads
+            // on `dynload.source_io_mutex` so shaping and rasterizing cannot
+            // race inside the process-wide single-threaded `Io` instance.
+            // Importing the same module instance the bindings use keeps one lock.
+            .{ .name = "dynload", .module = dynload_mod },
         },
     };
     const mod = if (expose) b.addModule("cozmic", core_opts) else b.createModule(core_opts);

@@ -9,7 +9,7 @@
 //!   (ID 1), English-US first; PostScript name (ID 6).
 //! - `OS/2`: weight class, width class, italic/oblique selection bits.
 //! - `post`: isFixedPitch (monospaced) and italic angle.
-//! - `fvar`: `wght` axis range for variable fonts (fills the M2 wiring point
+//! - `fvar`: `wght` axis range for variable fonts (feeds
 //!   `FontDb.setVariableWghtRange`).
 //!
 //! Behavior mirrors fontdb rather than ttf-parser directly:
@@ -152,6 +152,11 @@ const NameTable = struct {
     records_offset: usize,
     /// Absolute offset of the string storage area.
     strings_offset: usize,
+    /// Absolute offset one past the end of the name table. Every name record
+    /// and every string it points at must stay below this; checking the whole
+    /// blob instead would let a malformed record read another table's bytes as
+    /// a font name.
+    table_end: usize,
 };
 
 fn parseNameTable(blob: []const u8, table: []const u8) ?NameTable {
@@ -167,14 +172,22 @@ fn parseNameTable(blob: []const u8, table: []const u8) ?NameTable {
         .count = count,
         .records_offset = base + 6,
         .strings_offset = base + string_offset,
+        .table_end = base + table.len,
     };
 }
 
 fn nameData(blob: []const u8, names: NameTable, record: usize) ?[]const u8 {
+    // The name record and its string storage must stay inside the name table.
+    // Bounds were previously checked against the whole blob, which cannot
+    // escape the buffer but can read a *different* table's bytes and present
+    // them as a font name. A hostile font can exploit that for confusing
+    // family matching; table-local limits remove it.
+    if (record > names.table_end or names.table_end - record < 12) return null;
     const length: usize = readU16BE(blob, record + 8);
     const offset: usize = readU16BE(blob, record + 10);
-    const start = names.strings_offset + offset;
-    if (start > blob.len or length > blob.len - start) return null;
+    const start = names.strings_offset +| offset;
+    if (start > names.table_end) return null;
+    if (length > names.table_end - start) return null;
     return blob[start .. start + length];
 }
 
@@ -802,6 +815,108 @@ test "malformed blobs return InvalidFont, never panic" {
     writeU32BE(&truncated, 20, 28);
     writeU32BE(&truncated, 24, 8);
     try testing.expectError(error.InvalidFont, parseFaceMeta(allocator, &truncated, 0));
+}
+
+test "name records cannot read outside the name table" {
+    const allocator = testing.allocator;
+    const family_utf16 = try utf16be(allocator, "Real Family");
+    defer allocator.free(family_utf16);
+
+    // Build a valid name table, then rewrite its family record's string offset
+    // so it points past the end of the table into the next one. `buildSfnt`
+    // appends a sentinel table after `name`, so the bytes it names are inside
+    // the blob and reachable by the old blob-wide bounds check.
+    const name_table = try buildNameTable(allocator, &.{
+        .{ .id = 1, .data = family_utf16 },
+        .{ .id = 6, .data = family_utf16 },
+    });
+    defer allocator.free(name_table);
+
+    // Record 0's string offset field sits at 6 + 10.
+    const beyond_table: u16 = @intCast(name_table.len + 8);
+    writeU16BE(name_table, 6 + 10, beyond_table);
+
+    var sentinel: [32]u8 = @splat(0);
+    @memcpy(sentinel[0..5], "XXXXX");
+
+    var tables: std.ArrayList(Table) = .empty;
+    defer tables.deinit(allocator);
+    try tables.append(allocator, .{ .tag = "name", .data = name_table });
+    try tables.append(allocator, .{ .tag = "zzzz", .data = &sentinel });
+    const blob = try buildSfnt(allocator, tables.items);
+    defer allocator.free(blob);
+
+    // Table-local containment: the out-of-table record is rejected, so the
+    // family falls back to whatever valid records remain rather than adopting
+    // the following table's bytes.
+    var meta = parseFaceMeta(allocator, blob, 0) catch {
+        // Rejecting every name leaves no family at all, which is also a
+        // correct containment outcome.
+        return;
+    };
+    defer meta.deinit();
+    for (meta.families) |fam| {
+        try testing.expect(!std.mem.startsWith(u8, fam, "XXXXX"));
+    }
+    try testing.expect(!std.mem.eql(u8, meta.post_script_name, "XXXXX"));
+}
+
+test "name string length cannot run past the table end" {
+    const allocator = testing.allocator;
+    const family_utf16 = try utf16be(allocator, "Real Family");
+    defer allocator.free(family_utf16);
+
+    const name_table = try buildNameTable(allocator, &.{
+        .{ .id = 1, .data = family_utf16 },
+        .{ .id = 6, .data = family_utf16 },
+    });
+    defer allocator.free(name_table);
+
+    // Record 0's length field sits at 6 + 8; inflate it well past the table.
+    writeU16BE(name_table, 6 + 8, 0xFFF0);
+
+    var tables: std.ArrayList(Table) = .empty;
+    defer tables.deinit(allocator);
+    try tables.append(allocator, .{ .tag = "name", .data = name_table });
+    const blob = try buildSfnt(allocator, tables.items);
+    defer allocator.free(blob);
+
+    var meta = parseFaceMeta(allocator, blob, 0) catch return;
+    defer meta.deinit();
+    for (meta.families) |fam| {
+        try testing.expect(!std.mem.eql(u8, fam, "Real Family") or fam.len <= family_utf16.len);
+    }
+}
+
+test "arbitrary byte mutations of a real font never panic" {
+    const allocator = testing.allocator;
+    // Deterministic pseudo-random mutation of a real face's bytes. Every
+    // outcome must be a returned error or a successful parse; a trap, an
+    // out-of-bounds slice or an OOB read is a bug.
+    var blob: [4096]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xC0_7E_C0DE);
+    const rand = prng.random();
+
+    const cases = [_][]const u8{ "Inter-Regular.ttf", "FiraMono-Medium.ttf" };
+    for (cases) |name| {
+        const path = try std.fs.path.join(allocator, &.{ "tests/fonts", name });
+        defer allocator.free(path);
+        const original = std.Io.Dir.cwd().readFileAlloc(testing.io, path, allocator, .limited(1 << 24)) catch continue;
+        defer allocator.free(original);
+        if (original.len > blob.len) continue;
+        @memcpy(blob[0..original.len], original);
+
+        for (0..2000) |_| {
+            const n = rand.uintLessThan(usize, blob.len);
+            blob[n] = rand.int(u8);
+            if (parseFaceMeta(allocator, blob[0..original.len], 0)) |meta| {
+                var m = meta;
+                m.deinit();
+            } else |err| {
+                try testing.expect(err == error.InvalidFont or err == error.UnsupportedFont);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -179,16 +179,28 @@ fn emptyAttrsList(allocator: Allocator) AttrsList {
     });
 }
 
-/// Replace `dst` contents with a copy of `src`, reusing `dst` capacity.
-fn copyAttrsList(dst: *AttrsList, src: *const AttrsList) Allocator.Error!void {
-    var src_defaults = try src.default_attrs.to_attrs(dst.allocator);
-    defer src_defaults.deinit();
-    try dst.reset(&src_defaults);
+/// Build a fresh `AttrsList` copy of `src` on `allocator`.
+///
+/// Staging the whole attribute replacement *before* touching any text is what
+/// makes `append` and `setText` keep their caches consistent when an allocation
+/// fails: on failure `src` is untouched and the line still holds its previous
+/// text, spans and (still valid) shape cache. The returned list is committed by
+/// the caller and must not be freed twice.
+fn stageAttrsList(allocator: std.mem.Allocator, src: *const AttrsList) Allocator.Error!AttrsList {
+    var defaults = try src.default_attrs.clone_with(allocator);
+    errdefer defaults.deinit();
+    var staged = AttrsList.init_owned(allocator, defaults);
+    errdefer staged.deinit();
+    // Reserve the exact span count up front so the loop below cannot fail
+    // halfway and leave a partial list for the caller to mistake for a
+    // complete one.
+    try staged.spans.ensureTotalCapacity(allocator, src.spans.items.len);
     for (src.spans.items) |*span| {
-        var span_attrs = try span.attrs.to_attrs(dst.allocator);
+        var span_attrs = try span.attrs.to_attrs(allocator);
         defer span_attrs.deinit();
-        try dst.add_span(span.start, span.end, &span_attrs);
+        try staged.add_span(span.start, span.end, &span_attrs);
     }
+    return staged;
 }
 
 /// Free a shape cache payload (used/unused) and reset to `empty`.
@@ -372,11 +384,18 @@ pub const BufferLine = struct {
             ending != self.ending or
             !self.attrs_list.eql(attrs_list))
         {
-            self.text.clearRetainingCapacity();
-            try self.text.appendSlice(self.allocator, text_slice);
-            self.ending = ending;
-            try copyAttrsList(&self.attrs_list, attrs_list);
+            // Stage the replacement attributes before any destructive step, so
+            // an allocation failure leaves the line exactly as it was (text,
+            // ending and a still-valid shape cache all untouched).
+            var staged = try stageAttrsList(self.allocator, attrs_list);
+            errdefer staged.deinit();
+
             self.reset();
+            self.attrs_list.deinit();
+            self.attrs_list = staged;
+            self.text.clearRetainingCapacity();
+            self.text.appendSliceAssumeCapacity(text_slice);
+            self.ending = ending;
             return true;
         }
         return false;
@@ -424,23 +443,108 @@ pub const BufferLine = struct {
         return false;
     }
 
+    /// Reserve capacity so a following `append` of `other` cannot fail.
+    ///
+    /// `append` stages the joined attribute list and only then commits, so on
+    /// its own it already returns `error.OutOfMemory` without mutating
+    /// anything. This exists for callers with several fallible steps that want
+    /// the whole sequence to be allocation-free once it starts (see
+    /// `Editor.deleteRange`), where "unchanged on failure" is not enough because
+    /// earlier steps already moved text out of the line.
+    ///
+    /// The span-slot reservation is exact; the per-span `AttrsOwned` clones
+    /// `append` performs are the only allocations that can still fail, and only
+    /// for spans that own heap data (family name, metadata, feature values).
+    pub fn reserveAppend(self: *BufferLine, allocator: std.mem.Allocator, other: *const BufferLine) std.mem.Allocator.Error!void {
+        try self.text.ensureUnusedCapacity(allocator, other.text.items.len);
+        try self.attrs_list.spans.ensureUnusedCapacity(allocator, other.attrs_list.spans.items.len + 2);
+    }
+
     /// Append another line onto this one. The other's ending wins (line
     /// endings are preserved by moving to the joined line).
     pub fn append(self: *BufferLine, other: *const BufferLine) Error!void {
         const len = self.text.items.len;
-        try self.text.appendSlice(self.allocator, other.text.items);
-        self.ending = other.ending;
-        if (!self.attrs_list.default_attrs.eql(&other.attrs_list.default_attrs)) {
+        const added = other.text.items.len;
+
+        // Build the joined attribute list in a fresh list and only then touch
+        // `self`. The earlier ordering appended text first and fellible span
+        // work second, so `error.OutOfMemory` returned with the line's text
+        // already extended while its spans, and therefore its shape cache, still
+        // described the old text. Every fallible step now happens against
+        // `staged`, which is discarded on failure, leaving `self` untouched.
+        const needs_default_span = !self.attrs_list.default_attrs.eql(&other.attrs_list.default_attrs);
+        var own_defaults = try self.attrs_list.default_attrs.clone_with(self.allocator);
+        errdefer own_defaults.deinit();
+        var staged = AttrsList.init_owned(self.allocator, own_defaults);
+        errdefer staged.deinit();
+        // Upper bound on the resulting span count, so `add_span` below cannot
+        // allocate and fail partway through.
+        try staged.spans.ensureTotalCapacity(
+            self.allocator,
+            self.attrs_list.spans.items.len + other.attrs_list.spans.items.len + 2,
+        );
+        for (self.attrs_list.spans.items) |*span| {
+            var span_attrs = try span.attrs.to_attrs(self.allocator);
+            defer span_attrs.deinit();
+            try staged.add_span(span.start, span.end, &span_attrs);
+        }
+        if (needs_default_span) {
             var other_defaults = try other.attrs_list.default_attrs.to_attrs(self.allocator);
             defer other_defaults.deinit();
-            try self.attrs_list.add_span(len, len + other.text.items.len, &other_defaults);
+            try staged.add_span(len, len + added, &other_defaults);
         }
         for (other.attrs_list.spans.items) |*span| {
             var span_attrs = try span.attrs.to_attrs(self.allocator);
             defer span_attrs.deinit();
-            try self.attrs_list.add_span(span.start + len, span.end + len, &span_attrs);
+            try staged.add_span(span.start + len, span.end + len, &span_attrs);
         }
+        // Last remaining fallible step, still without mutating `self`.
+        try self.text.ensureUnusedCapacity(self.allocator, added);
+
+        // Commit. Nothing below can fail.
         self.reset();
+        self.attrs_list.deinit();
+        self.attrs_list = staged;
+        self.text.appendSliceAssumeCapacity(other.text.items);
+        self.ending = other.ending;
+    }
+
+    /// Split off a new line at a byte index, reusing the line's text buffer.
+    ///
+    /// `splitOff` copies the suffix into a fresh `ArrayList`, so its text side
+    /// cannot fail. This variant hands over the line's own buffer with its
+    /// length truncated to `index`: no text is copied. The attrs side is the
+    /// same call as `splitOff` (`AttrsList.split_off` rebuilds the span list)
+    /// and can still return `error.OutOfMemory`; callers sequence it so that
+    /// happens before any destructive step.
+    ///
+    /// `BufferLine.init` performs the same in-place transfer when constructing
+    /// a line from borrowed bytes, so this keeps the two paths symmetric.
+    pub fn splitOffInPlace(self: *BufferLine, index: usize) Error!BufferLine {
+        if (index > self.text.items.len or !isBoundary(self.text.items, index)) {
+            return error.InvalidByteIndex;
+        }
+        // Build the attribute half first: it is the only part that can fail, and
+        // a failure here must leave the line completely untouched (the text
+        // buffer has already been handed over by the time it would run).
+        const new_attrs = try self.attrs_list.split_off(index);
+        errdefer new_attrs.deinit();
+        var new_text = self.text;
+        new_text.items.len = index;
+        self.text = .empty;
+        self.reset();
+        return .{
+            .allocator = self.allocator,
+            .text = new_text,
+            .ending = self.ending,
+            .attrs_list = new_attrs,
+            .alignment = self.alignment,
+            .shape_cache = .empty,
+            .layout_cache = .empty,
+            .shape_buffer = ShapeBuffer.init(),
+            .shaping = self.shaping,
+            .metadata = null,
+        };
     }
 
     /// Split off a new line at a byte index. The ending moves to the new
