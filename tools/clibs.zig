@@ -188,8 +188,8 @@ fn buildPng(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.
     m.addCSourceFiles(.{
         .root = png_dep.path("."),
         .files = &.{
-            "png.c",      "pngerror.c", "pngget.c",  "pngmem.c",   "pngread.c",
-            "pngrio.c",   "pngrtran.c", "pngrutil.c", "pngset.c",  "pngtrans.c",
+            "png.c",    "pngerror.c", "pngget.c",   "pngmem.c", "pngread.c",
+            "pngrio.c", "pngrtran.c", "pngrutil.c", "pngset.c", "pngtrans.c",
         },
         .flags = flags,
     });

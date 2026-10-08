@@ -99,7 +99,6 @@ pub const FaceEntry = struct {
     }
 };
 
-
 /// Registry of FreeType faces, one per cozmic `font_id`.
 pub const Raster = struct {
     allocator: std.mem.Allocator,
