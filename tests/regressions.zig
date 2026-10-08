@@ -1281,3 +1281,21 @@ test "a missing family falls through to the common fallback list" {
     // An installed family still wins.
     try std.testing.expectEqualStrings("Inter", try shapedFamily(&fs, "Inter", "Hello"));
 }
+
+test "Buffer.measure reports the widest line and total height" {
+    var fs = try fonts.fontSystem(a);
+    defer fs.deinit();
+    var attrs = fonts.attrsWithFamily(a, "Inter");
+    defer attrs.deinit();
+    var buf = try c.Buffer.initWithAllocator(a, c.Metrics.new(20, 30));
+    defer buf.deinit();
+    try buf.setText("short\na much longer second line\nmid", &attrs, .advanced, null);
+    try buf.shapeUntilScroll(&fs, false);
+    const size = buf.measure();
+    var widest: f32 = 0;
+    var it = buf.layoutRuns();
+    while (it.next()) |run| widest = @max(widest, run.line_w);
+    try std.testing.expectEqual(widest, size.width);
+    try std.testing.expect(size.width > 100);
+    try std.testing.expectEqual(@as(f32, 90), size.height);
+}

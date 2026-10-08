@@ -205,6 +205,12 @@ pub const LayoutRun = struct {
     }
 };
 
+/// Laid-out text extent in pixels (`Buffer.measure`).
+pub const Measurement = struct {
+    width: f32,
+    height: f32,
+};
+
 pub const Highlight = struct {
     x: f32,
     width: f32,
@@ -508,18 +514,20 @@ pub const Buffer = struct {
                     ll.glyphs.items[ll.glyphs.items.len - 1]
                 else
                     null;
-                if (glyph_opt) |glyph| {
-                    const x_min = @min(glyph.x, glyph.x + glyph.w);
-                    const x_max = @max(glyph.x, glyph.x + glyph.w);
-                    if (x_min < self.scroll.horizontal) {
-                        self.scroll.horizontal = x_min;
+                // An empty line counts as (0, 0) (buffer.rs:548 `map_or`), so
+                // moving onto it scrolls back to the left edge.
+                const x_min: f32, const x_max: f32 = if (glyph_opt) |glyph|
+                    .{ @min(glyph.x, glyph.x + glyph.w), @max(glyph.x, glyph.x + glyph.w) }
+                else
+                    .{ 0, 0 };
+                if (x_min < self.scroll.horizontal) {
+                    self.scroll.horizontal = x_min;
+                    self.redraw = true;
+                }
+                if (self.width_opt) |width| {
+                    if (x_max > self.scroll.horizontal + width) {
+                        self.scroll.horizontal = x_max - width;
                         self.redraw = true;
-                    }
-                    if (self.width_opt) |width| {
-                        if (x_max > self.scroll.horizontal + width) {
-                            self.scroll.horizontal = x_max - width;
-                            self.redraw = true;
-                        }
                     }
                 }
             }
@@ -1058,6 +1066,21 @@ pub const Buffer = struct {
 
     /// Visible layout runs. Call `shapeUntilScroll` first (or use
     /// `BufferWithFontSystem`, which does it automatically).
+    /// Bounding box of the visible laid-out text: the widest run's
+    /// `line_w` and the bottom of the last run. Covers what `layoutRuns`
+    /// yields, so shape first (`shapeUntilScroll`) and leave the height
+    /// unbounded (`setSize(w, null)`) to measure the whole buffer. Upstream
+    /// callers compute this by hand from `layout_runs()`.
+    pub fn measure(self: *const Buffer) Measurement {
+        var out: Measurement = .{ .width = 0, .height = 0 };
+        var it = self.layoutRuns();
+        while (it.next()) |run| {
+            out.width = @max(out.width, run.line_w);
+            out.height = @max(out.height, run.line_top + run.line_height);
+        }
+        return out;
+    }
+
     pub fn layoutRuns(self: *const Buffer) LayoutRunIter {
         return LayoutRunIter.init(
             self.lines.items,
@@ -1546,6 +1569,12 @@ pub const BufferWithFontSystem = struct {
 
     pub fn lineLayout(self: *BufferWithFontSystem, line_i: usize) Error!?[]LayoutLine {
         return self.buffer.lineLayout(self.font_system, line_i);
+    }
+
+    /// Shape what is visible, then `Buffer.measure`.
+    pub fn measure(self: *BufferWithFontSystem) Error!Measurement {
+        try self.buffer.shapeUntilScroll(self.font_system, false);
+        return self.buffer.measure();
     }
 
     pub fn layoutRuns(self: *BufferWithFontSystem) Error!LayoutRunIter {

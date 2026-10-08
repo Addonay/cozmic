@@ -182,6 +182,105 @@ pub const Change = struct {
     }
 };
 
+/// Bounded undo/redo history over recorded `Change`s.
+///
+/// Upstream's core `Editor` only records changes; history lives in its Vi
+/// editor. This is an opt-in layer for any `Editor`:
+///
+/// ```
+/// editor.startChange();
+/// try editor.action(&font_system, .{ .insert = 'a' });
+/// if (editor.finishChange()) |change| try history.push(change);
+/// _ = try history.undo(&editor);
+/// ```
+///
+/// Each `push` is one undo step, so group keystrokes by choosing when to
+/// call `startChange`/`finishChange`.
+pub const History = struct {
+    allocator: Allocator,
+    undo_stack: std.ArrayList(Change) = .empty,
+    redo_stack: std.ArrayList(Change) = .empty,
+    /// Oldest steps are dropped beyond this many.
+    limit: usize = 1000,
+
+    pub fn init(allocator: Allocator) History {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *History) void {
+        clearStack(self.allocator, &self.undo_stack);
+        clearStack(self.allocator, &self.redo_stack);
+        self.undo_stack.deinit(self.allocator);
+        self.redo_stack.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn clearStack(allocator: Allocator, stack: *std.ArrayList(Change)) void {
+        for (stack.items) |*c| c.deinit(allocator);
+        stack.clearRetainingCapacity();
+    }
+
+    /// Record a finished change as one undo step, taking ownership of it.
+    /// Empty changes are dropped. A new step discards the redo stack.
+    pub fn push(self: *History, change: Change) Allocator.Error!void {
+        var owned = change;
+        if (owned.items.items.len == 0) {
+            owned.deinit(self.allocator);
+            return;
+        }
+        if (self.limit == 0) {
+            owned.deinit(self.allocator);
+            return;
+        }
+        if (self.undo_stack.items.len >= self.limit) {
+            var oldest = self.undo_stack.orderedRemove(0);
+            oldest.deinit(self.allocator);
+        }
+        self.undo_stack.append(self.allocator, owned) catch |err| {
+            owned.deinit(self.allocator);
+            return err;
+        };
+        clearStack(self.allocator, &self.redo_stack);
+    }
+
+    pub fn canUndo(self: *const History) bool {
+        return self.undo_stack.items.len > 0;
+    }
+
+    pub fn canRedo(self: *const History) bool {
+        return self.redo_stack.items.len > 0;
+    }
+
+    /// Revert the newest step. Returns false when there is nothing to undo or
+    /// `editor` has an open, non-empty change (finish it first).
+    pub fn undo(self: *History, editor: *Editor) Error!bool {
+        return move(self.allocator, editor, &self.undo_stack, &self.redo_stack);
+    }
+
+    /// Re-apply the newest undone step.
+    pub fn redo(self: *History, editor: *Editor) Error!bool {
+        return move(self.allocator, editor, &self.redo_stack, &self.undo_stack);
+    }
+
+    fn move(allocator: Allocator, editor: *Editor, from: *std.ArrayList(Change), to: *std.ArrayList(Change)) Error!bool {
+        if (from.items.len == 0) return false;
+        try to.ensureUnusedCapacity(allocator, 1);
+        const change = &from.items[from.items.len - 1];
+        change.reverse();
+        const applied = editor.applyChange(change) catch |err| {
+            change.reverse();
+            return err;
+        };
+        if (!applied) {
+            change.reverse();
+            return false;
+        }
+        editor.selection = .{ .none = {} };
+        to.appendAssumeCapacity(from.pop().?);
+        return true;
+    }
+};
+
 /// An editing action, mirroring cosmic-text `Action`.
 pub const Action = union(enum) {
     motion: Motion,
@@ -2862,4 +2961,51 @@ test "e2e: type e+U+0301cole, Delete at 0 leaves \"cole\" (real font fixture)" {
     var t = try ed.fullText();
     defer t.deinit(alloc);
     try std.testing.expectEqualStrings("cole", t.items);
+}
+
+test "History undoes and redoes grouped edits" {
+    const alloc = std.testing.allocator;
+    var fsys = try FontSystem.init(alloc);
+    defer fsys.deinit();
+    var ed = try Editor.init(alloc);
+    defer ed.deinit();
+    var history = History.init(alloc);
+    defer history.deinit();
+
+    for ([_][]const u8{ "hello", " world" }) |word| {
+        ed.startChange();
+        for (word) |ch| try ed.action(&fsys, .{ .insert = ch });
+        try history.push(ed.finishChange().?);
+    }
+    // A deletion is a step too.
+    ed.startChange();
+    try ed.action(&fsys, .backspace);
+    try history.push(ed.finishChange().?);
+
+    const expectText = struct {
+        fn check(e: *const Editor, want: []const u8) !void {
+            var t = try e.fullText();
+            defer t.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings(want, t.items);
+        }
+    }.check;
+
+    try expectText(&ed, "hello worl");
+    try std.testing.expect(try history.undo(&ed));
+    try expectText(&ed, "hello world");
+    try std.testing.expect(try history.undo(&ed));
+    try expectText(&ed, "hello");
+    try std.testing.expect(try history.redo(&ed));
+    try expectText(&ed, "hello world");
+    try std.testing.expect(try history.undo(&ed));
+    try std.testing.expect(try history.undo(&ed));
+    try expectText(&ed, "");
+    try std.testing.expect(!try history.undo(&ed));
+
+    // A new step after undo discards the redo stack.
+    ed.startChange();
+    try ed.action(&fsys, .{ .insert = 'x' });
+    try history.push(ed.finishChange().?);
+    try std.testing.expect(!history.canRedo());
+    try expectText(&ed, "x");
 }

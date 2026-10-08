@@ -63,6 +63,7 @@ pub const Buffer = buffer.Buffer;
 pub const BufferWithFontSystem = buffer.BufferWithFontSystem;
 pub const BufferLine = buffer_line.BufferLine;
 pub const Editor = edit.Editor;
+pub const History = edit.History;
 pub const Selection = edit.Selection;
 pub const Change = edit.Change;
 pub const ChangeItem = edit.ChangeItem;
@@ -89,6 +90,7 @@ pub const Scroll = cursor.Scroll;
 pub const Affinity = cursor.Affinity;
 pub const FontId = layout.FontId;
 pub const CursorPosition = buffer.CursorPosition;
+pub const Measurement = buffer.Measurement;
 pub const SwashCache = swash_cache.SwashCache;
 pub const Raster = font_raster.Raster;
 
