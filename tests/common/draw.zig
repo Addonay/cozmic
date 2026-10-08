@@ -312,7 +312,7 @@ pub fn channelMassStats(actual: []const u8, reference: []const u8) ChannelMassSt
 fn readBaseline(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
     var last_err: anyerror = error.FileNotFound;
     for (IMAGE_DIRS) |dir| {
-        const file_name = try std.fmt.allocPrint(alloc, "{s}.png", .{name});
+        const file_name = try alloc.print("{s}.png", .{name});
         defer alloc.free(file_name);
         const path = try std.fs.path.join(alloc, &.{ dir, file_name });
         defer alloc.free(path);
@@ -342,7 +342,7 @@ fn blessDir() []const u8 {
 pub fn bless(alloc: std.mem.Allocator, cfg: DrawTestCfg, pm: *const pixmap.Pixmap) !void {
     const bytes = try png.encodeAlloc(alloc, pm.width, pm.height, pm.data);
     defer alloc.free(bytes);
-    const file_name = try std.fmt.allocPrint(alloc, "{s}.png", .{cfg.name});
+    const file_name = try alloc.print("{s}.png", .{cfg.name});
     defer alloc.free(file_name);
     const path = try std.fs.path.join(alloc, &.{ blessDir(), file_name });
     defer alloc.free(path);

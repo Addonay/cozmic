@@ -825,7 +825,7 @@ pub const SystemFontEnv = struct {
 
 /// Host platform at comptime (`.other` for unsupported/unix targets).
 pub fn hostPlatform() Platform {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => .windows,
         .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => .macos,
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => .linux,
@@ -1614,8 +1614,8 @@ pub const FontSystem = struct {
         return self.loadSystemFontsConfigured(io, hostPlatform(), .{
             .xdg_data_home = xdg_data_home,
             .home = home,
-            .windir = if (builtin.os.tag == .windows) getenvSpan("WINDIR") else null,
-            .local_appdata = if (builtin.os.tag == .windows) getenvSpan("LOCALAPPDATA") else null,
+            .windir = if (builtin.target.os.tag == .windows) getenvSpan("WINDIR") else null,
+            .local_appdata = if (builtin.target.os.tag == .windows) getenvSpan("LOCALAPPDATA") else null,
         }, &.{}, true);
     }
 

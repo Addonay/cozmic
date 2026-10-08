@@ -20,7 +20,7 @@ const builtin = @import("builtin");
 /// Zig release's `std.DynLib` is POSIX/Darwin-only; its `.dll` candidate
 /// names stay in `libCandidates` for a future loader, but `load()` returns
 /// null there and discovery uses the directory-scan fallback.
-const dynlib_supported = switch (builtin.os.tag) {
+const dynlib_supported = switch (builtin.target.os.tag) {
     .linux,
     .freebsd,
     .netbsd,
@@ -299,7 +299,7 @@ const Api = struct {
 /// Homebrew/usr-local prefixes so a non-standard install is found without
 /// DYLD settings; Windows names match msys2/vcpkg builds.
 fn libCandidates() []const []const u8 {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => &[_][]const u8{
             "libfontconfig.so.1",
             "libfontconfig.so",

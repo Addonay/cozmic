@@ -70,7 +70,7 @@ pub const Library = struct {
     /// `*std.DynLib` where it exists (POSIX), a Win32 `HMODULE` otherwise.
     /// Chosen with a comptime `switch` so the POSIX arm is not analyzed on
     /// Windows.
-    const Handle = switch (builtin.os.tag) {
+    const Handle = switch (builtin.target.os.tag) {
         .windows => *anyopaque,
         else => *std.DynLib,
     };
@@ -79,7 +79,7 @@ pub const Library = struct {
     /// Returns `null` when every candidate is missing or cannot be loaded.
     /// Never panics.
     pub fn open(candidates: []const []const u8) ?Library {
-        return if (builtin.os.tag == .windows)
+        return if (builtin.target.os.tag == .windows)
             openWindows(candidates)
         else
             openPosix(candidates);
@@ -88,7 +88,7 @@ pub const Library = struct {
     /// Resolve `name` to its address; `null` when the symbol does not exist
     /// or `name` does not fit the sentinel buffer.
     pub fn lookupSymbol(self: *const Library, name: []const u8) ?*anyopaque {
-        return if (builtin.os.tag == .windows)
+        return if (builtin.target.os.tag == .windows)
             lookupWindows(self, name)
         else
             lookupPosix(self, name);
@@ -97,7 +97,7 @@ pub const Library = struct {
     /// Release the handle. Not needed for the process-lifetime caches, but
     /// used by tests; the `Library` must not be used afterwards.
     pub fn close(self: *Library) void {
-        if (builtin.os.tag == .windows) {
+        if (builtin.target.os.tag == .windows) {
             closeWindows(self);
         } else {
             closePosix(self);
@@ -184,7 +184,7 @@ fn toSentinel(name: []const u8, buf: []u8) ?[:0]const u8 {
 const testing = std.testing;
 
 test "opens a known host library and resolves a symbol" {
-    const candidates: []const []const u8 = switch (builtin.os.tag) {
+    const candidates: []const []const u8 = switch (builtin.target.os.tag) {
         .windows => &.{"kernel32.dll"},
         .macos => &.{"libSystem.B.dylib"},
         else => &.{ "libc.cozmic-does-not-exist.so", "libc.so.6", "libc.so" },
@@ -193,7 +193,7 @@ test "opens a known host library and resolves a symbol" {
     defer lib.close();
 
     // Exported by glibc's libc.so.6, macOS libSystem and Windows kernel32.
-    const symbol = if (builtin.os.tag == .windows) "GetCurrentProcessId" else "malloc";
+    const symbol = if (builtin.target.os.tag == .windows) "GetCurrentProcessId" else "malloc";
     try testing.expect(Library.lookupSymbol(&lib, symbol) != null);
     // A symbol that cannot exist: null, not a crash.
     try testing.expect(Library.lookupSymbol(&lib, "cozmic_no_such_symbol_9f3d") == null);

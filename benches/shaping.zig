@@ -18,7 +18,7 @@ fn buildStress(arena: std.mem.Allocator) ![]u8 {
     const s2 = try repeat(arena, "Mixed English + العربية for BiDi optimizations. ", 12);
     const s3 = try repeat(arena, "Very long wrapping line that will trigger reorder optimizations multiple times through intensive layout processing. ", 8);
     const s4 = try repeat(arena, "Cache key generation line for ShapeRunKey optimization testing. ", 10);
-    const joined = try std.fmt.allocPrint(arena, "{s}\n{s}\n{s}\n{s}\n", .{ s1, s2, s3, s4 });
+    const joined = try arena.print("{s}\n{s}\n{s}\n{s}\n", .{ s1, s2, s3, s4 });
     defer arena.free(joined);
     return repeat(arena, joined, 10);
 }

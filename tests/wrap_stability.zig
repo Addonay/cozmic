@@ -205,9 +205,9 @@ test "wrap stability: stable_wrap" {
     var checks_run: usize = 0;
 
     for (cases.items) |text| {
-        const with_spaces = try std.fmt.allocPrint(alloc, "{s}            ", .{text});
+        const with_spaces = try alloc.print("{s}            ", .{text});
         defer alloc.free(with_spaces);
-        const with_spaces_2 = try std.fmt.allocPrint(alloc, "{s}    ", .{text});
+        const with_spaces_2 = try alloc.print("{s}    ", .{text});
         defer alloc.free(with_spaces_2);
 
         for ([_][]const u8{ text, with_spaces, with_spaces_2 }) |variant| {

@@ -93,7 +93,7 @@ var runtime: Runtime = .{};
 /// tried before the bare names on macOS; Linux/BSD rely on the loader search
 /// path (`ldconfig`/`rpath`).
 fn candidates() []const []const u8 {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .macos => &[_][]const u8{
             "/opt/homebrew/lib/libfreetype.6.dylib",
             "/usr/local/lib/libfreetype.6.dylib",
