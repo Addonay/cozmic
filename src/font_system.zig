@@ -1101,15 +1101,23 @@ const ShaperResolver = struct {
         const matches = matchesFor(self, query) orelse return null;
         const primary = effectivePrimary(self, query, script, matches);
         const list = candidates(self, script, matches, primary);
-        if (list.full) return null;
-        return if (attempt < list.count) list.ids[attempt] else null;
+        if (attempt < list.count) return list.ids[attempt];
+        if (!list.full) return null;
+        // The buffer filled up. Machines with many fonts reach this easily, since the
+        // last phase offers every usable face, so keep walking the remaining matches.
+        var remaining = attempt - list.count;
+        for (matches) |m| {
+            if (!self.canUseFontSource(m.id) or list.contains(m.id)) continue;
+            if (remaining == 0) return m.id;
+            remaining -= 1;
+        }
+        return null;
     }
 
     /// Phase-ordered, deduplicated candidates excluding `primary`.
     /// `fallbackFor` cannot report errors, so they live in a bounded stack
-    /// buffer. Overflow degrades to "list exhausted" (the OOM-as-no-match
-    /// policy of `matchesFor`); it needs more than MAX_FALLBACK_CANDIDATES
-    /// usable faces.
+    /// buffer. When more than MAX_FALLBACK_CANDIDATES faces are usable, `full`
+    /// is set and `fallbackFor` continues with the faces that did not fit.
     fn candidates(
         self: *FontSystem,
         script: shape_mod.Script,
@@ -1145,11 +1153,16 @@ const ShaperResolver = struct {
         full: bool = false,
         primary: ?FontId,
 
-        fn offer(self: *Candidates, id: FontId) void {
-            if (self.primary == id) return;
+        fn contains(self: *const Candidates, id: FontId) bool {
+            if (self.primary == id) return true;
             for (self.ids[0..self.count]) |seen| {
-                if (seen == id) return;
+                if (seen == id) return true;
             }
+            return false;
+        }
+
+        fn offer(self: *Candidates, id: FontId) void {
+            if (self.contains(id)) return;
             if (self.count == self.ids.len) {
                 self.full = true;
                 return;
@@ -2590,6 +2603,50 @@ test "fallbackFor is stateless and ordered after the primary" {
     // Exhaustion alone does not memoize a negative: the memo only trusts runs
     // the `note_fallback` hook reported, so direct probing stays stateless.
     try t.expectEqual(@as(?shape_mod.FontId, id_b), adapter.fallbackFor(query, .latin, 0));
+}
+
+test "fallbackFor reaches every face when there are more than the candidate buffer holds" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const noto = try fontFixturePath(alloc, "NotoSans-Regular.ttf");
+    defer alloc.free(noto);
+    const arabic = try fontFixturePath(alloc, "NotoSansArabic.ttf");
+    defer alloc.free(arabic);
+
+    var fs = try FontSystem.init(alloc);
+    defer fs.deinit();
+
+    const filler = MAX_FALLBACK_CANDIDATES + 10;
+    var ids: [filler]FontId = undefined;
+    for (&ids, 0..) |*id, i| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "BulkFam-{d}", .{i});
+        id.* = try fs.db.addFace(noto, 0, &.{"BulkFam"}, name, 400, .normal, .normal, false);
+        try fs.addFontSource(id.*, noto, 0, false, false, null);
+    }
+    // The only face covering Arabic comes last, past what the buffer holds.
+    const last = try fs.db.addFace(arabic, 0, &.{"BulkFam"}, "BulkFam-Arabic", 400, .normal, .normal, false);
+    try fs.addFontSource(last, arabic, 0, false, false, null);
+
+    const adapter = fs.shaper() orelse return error.FontFixtureLoadFailed;
+    const query = shape_mod.FontQuery{ .family_kind = .name, .family_name = "BulkFam" };
+    const primary = adapter.fontFor(query).?;
+
+    // Every face other than the primary comes up exactly once, then the list ends.
+    var seen: std.AutoHashMapUnmanaged(shape_mod.FontId, void) = .empty;
+    defer seen.deinit(alloc);
+    var attempt: usize = 0;
+    while (adapter.fallbackFor(query, .latin, attempt)) |id| : (attempt += 1) {
+        try t.expect(id != primary);
+        try t.expect(!seen.contains(id));
+        try seen.put(alloc, id, {});
+    }
+    try t.expectEqual(@as(usize, filler), attempt);
+    try t.expect(seen.contains(last));
+
+    // Probing past the buffer is as stateless as probing inside it.
+    const beyond = adapter.fallbackFor(query, .latin, MAX_FALLBACK_CANDIDATES + 2).?;
+    try t.expectEqual(beyond, adapter.fallbackFor(query, .latin, MAX_FALLBACK_CANDIDATES + 2).?);
 }
 
 test "failed lazy source is skipped by the resolver" {
