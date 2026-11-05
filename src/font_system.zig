@@ -1289,6 +1289,27 @@ pub const FontSystem = struct {
         return true;
     }
 
+    /// Registers every face in an in-memory font file for both matching and
+    /// shaping, and returns how many there were (GPUI `TextSystem::add_fonts`).
+    /// The bytes are copied. A face that fails to parse is skipped; a file with
+    /// no usable face is `error.InvalidFont`.
+    pub fn addFontBytes(self: *FontSystem, bytes: []const u8) (std.mem.Allocator.Error || error{ InvalidFont, LibraryUnavailable, MissingSymbol })!u32 {
+        const count = font_parse.fontsInCollection(bytes);
+        var added: u32 = 0;
+        var index: u32 = 0;
+        while (index < count) : (index += 1) {
+            const id = self.db.addFaceFromBytes(bytes, index, "") catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            const info = self.db.face(id).?;
+            try self.addFontData(id, bytes, index, info.style != .normal, null);
+            added += 1;
+        }
+        if (added == 0) return error.InvalidFont;
+        return added;
+    }
+
     /// Register font bytes with the HarfBuzz shaping backend under `id`
     /// (lazily creates the backend). The backend copies the bytes; the caller
     /// keeps ownership. Pair it with `dbMut().addFace` so family matching and
@@ -2097,6 +2118,25 @@ test "locale normalize and env selection fallback" {
     const f = try systemLocaleFromEnv(alloc, "", "POSIX");
     defer alloc.free(f);
     try t.expectEqualStrings("en-US", f);
+}
+
+test "addFontBytes makes a font usable for matching and shaping" {
+    const alloc = std.testing.allocator;
+    const path = fontFixturePath(alloc, "FiraMono-Medium.ttf") catch return error.SkipZigTest;
+    defer alloc.free(path);
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    const bytes = try alloc.alloc(u8, @intCast(try file.length(std.testing.io)));
+    defer alloc.free(bytes);
+    _ = try file.readPositionalAll(std.testing.io, bytes, 0);
+
+    var fs = try FontSystem.init(alloc);
+    defer fs.deinit();
+    try std.testing.expectEqual(@as(u32, 1), try fs.addFontBytes(bytes));
+    const id = fs.db.query(.{ .name = "Fira Mono" }, 500, .normal, .normal).?;
+    try std.testing.expect(fs.fontBytes(id) != null);
+    try std.testing.expect(fs.hasShaper());
+    try std.testing.expectError(error.InvalidFont, fs.addFontBytes("not a font"));
 }
 
 test "failed addFontData does not leave a live empty shaper backend" {
