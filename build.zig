@@ -39,13 +39,13 @@ pub fn build(b: *std.Build) void {
     // The C libraries are compiled once (always optimized, see tools/clibs.zig)
     // and shared by the library, tests and benches. `null` while the lazy
     // source packages are still being fetched; the runner then re-runs build.
+    // A dependent's build script runs in that first pass too and asks for our
+    // modules, so they must exist by then, unlinked.
     const libs: ?clibs.Libs = if (system_libs) null else clibs.build(b, .{
         .target = target,
         .optimize = optimize,
         .color_bitmaps = color_bitmaps,
     });
-    if (!system_libs and libs == null) return;
-
     const graph: Graph = .{
         .target = target,
         .build_options = build_options,
@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .libs = libs,
     };
     const mod = graph.create(b, optimize, true);
+    if (!system_libs and libs == null) return;
 
     // Demo executable: shapes one line with the host's fonts.
     const exe = b.addExecutable(.{
