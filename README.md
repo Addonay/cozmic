@@ -88,10 +88,11 @@ Build options:
 
 - `-Dsystem-libs` (default off): load the host's HarfBuzz/FreeType shared
   libraries at runtime instead of bundling them. `cozmic.backendVersion`
-  then reports the loaded versions and why a load failed.
+  then reports the loaded versions and why a load failed. COLRv1 color glyphs
+  need the bundled HarfBuzz's rasterizer and do not draw in this mode.
 - `-Dcolor-bitmaps=false` (default on): leave out zlib + libpng, which FreeType
-  needs only for PNG color bitmap glyphs (CBDT/sbix emoji such as Noto Color
-  Emoji). COLR vector color glyphs work either way.
+  needs only for PNG color bitmap glyphs (CBDT/sbix emoji such as the bitmap
+  Noto Color Emoji). COLR vector color glyphs, v0 and v1, work either way.
 - `-Dvi`, `-Dsyntect` (default off): export the experimental `cozmic.vi` /
   `cozmic.syntect` surfaces; their `*_enabled` constants report readiness.
 
@@ -99,6 +100,6 @@ Build options:
 
 On matched cold-layout workloads with identical glyph output, cozmic takes
 0.64x–0.87x of cosmic-text's time at the same peak RSS (5.3 MiB). A
-ReleaseSmall demo binary is 1.55 MB stripped with no shared-library
+ReleaseSmall demo binary is 1.72 MB stripped with no shared-library
 dependencies besides libc. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for
 methodology, memory, run-cache semantics and size breakdown.

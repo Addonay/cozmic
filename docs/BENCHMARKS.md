@@ -100,10 +100,11 @@ registration and raster-producer changes clear it.
 
 ## Binary size
 
-`zig build -Doptimize=ReleaseSmall` produces a 1.55 MB stripped `cozmic` demo
+`zig build -Doptimize=ReleaseSmall` produces a 1.72 MB stripped `cozmic` demo
 (the full Buffer pipeline, ezi-code Unicode tables and bundled HarfBuzz) whose
-only shared-library dependency is libc. HarfBuzz accounts for about 0.78 MB of
-it; libc++ for 8 KB, since only headers are used. The equivalent stripped
+only shared-library dependency is libc. HarfBuzz accounted for about 0.78 MB of
+it before its color and paint code was enabled for COLRv1, which added 0.17 MB;
+libc++ for 8 KB, since only headers are used. The equivalent stripped
 cosmic-text release probe is 1.69 MB.
 
 A program that also rasterizes links FreeType: at most 0.40 MB (the

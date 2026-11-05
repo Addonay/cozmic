@@ -639,7 +639,7 @@ fn pixelsTo26_6(v: f32) c_long {
 /// tan(14 degrees) in FreeType 16.16 fixed point, the X skew applied by
 /// `FAKE_ITALIC` (swash.rs:70-77: `Transform::skew(14deg, 0deg)`).
 const FAKE_ITALIC_TAN: f64 = 0.24932800284318068;
-const FAKE_ITALIC_MATRIX_XY: c_long = @intFromFloat(FAKE_ITALIC_TAN * 65536.0);
+pub const FAKE_ITALIC_MATRIX_XY: c_long = @intFromFloat(FAKE_ITALIC_TAN * 65536.0);
 
 /// User state for `FT_Outline_Decompose` (see `Face.outlineCommands`).
 /// FreeType reports points in26.6 fixed point; this converts to pixel-space

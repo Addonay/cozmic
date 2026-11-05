@@ -100,8 +100,10 @@ pub fn build(b: *std.Build, opts: Options) ?Libs {
     });
     const hb = harfbuzz.root_module;
     // A curated subset of HarfBuzz's HB_LEAN: drops APIs cozmic never calls
-    // (serialization, drawing/paint, color, math, glyph names, file opening)
-    // while keeping variations, metrics, AAT and the locale-default language.
+    // (serialization, math, glyph names, file opening) while keeping
+    // variations, metrics, AAT and the locale-default language. Color, drawing
+    // and paint stay: hb-raster renders COLRv1 glyphs, which FreeType cannot.
+    // hb-raster's SVG support stays out, and zlib with it.
     for ([_][]const u8{
         "HB_DISABLE_DEPRECATED",
         "HB_NO_ATEXIT",
@@ -109,9 +111,6 @@ pub fn build(b: *std.Build, opts: Options) ?Libs {
         "HB_NO_BUFFER_SERIALIZE",
         "HB_NO_BUFFER_VERIFY",
         "HB_NO_BITMAP",
-        "HB_NO_COLOR",
-        "HB_NO_DRAW",
-        "HB_NO_PAINT",
         "HB_NO_ERRNO",
         "HB_NO_FACE_COLLECT_UNICODES",
         "HB_NO_GETENV",
@@ -119,6 +118,7 @@ pub fn build(b: *std.Build, opts: Options) ?Libs {
         "HB_NO_LAYOUT_COLLECT_GLYPHS",
         "HB_NO_LAYOUT_FEATURE_PARAMS",
         "HB_NO_MATH",
+        "HB_NO_RASTER_SVG",
         "HB_NO_META",
         "HB_NO_MMAP",
         "HB_NO_NAME",
@@ -130,7 +130,13 @@ pub fn build(b: *std.Build, opts: Options) ?Libs {
     }) |m| hb.addCMacro(m, "1");
     hb.addCSourceFiles(.{
         .root = hb_dep.path("src"),
-        .files = &.{"harfbuzz.cc"},
+        .files = &.{
+            "harfbuzz.cc",
+            "hb-raster.cc",
+            "hb-raster-image.cc",
+            "hb-raster-draw.cc",
+            "hb-raster-paint.cc",
+        },
         .flags = &.{
             "-std=c++11",
             "-fno-exceptions",

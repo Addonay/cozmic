@@ -43,6 +43,7 @@ const glyph_cache = @import("glyph_cache.zig");
 const font_system = @import("font_system.zig");
 const dynload = @import("dynload");
 const font_blob = @import("font_blob.zig");
+const color_raster = @import("color_raster.zig");
 /// Outline command type (type-only back-reference; `swash_cache` imports this
 /// file for the `Raster` field, and neither layout depends on the other —
 /// Zig resolves the accepted cycle, see raster_ft.zig).
@@ -83,8 +84,17 @@ pub const FaceEntry = struct {
     /// retry stays cached (OOM never sets this). Reset when a load succeeds.
     /// Mirrors `shape_hb.FontEntry.load_retried`.
     load_retried: bool = false,
+    /// Face index inside the file; set once loaded.
+    index: i32 = 0,
+    /// HarfBuzz's view of the same bytes, created by the first color glyph.
+    color_font: ?color_raster.Font = null,
+    /// `Font.create` failed once: not retried for every glyph.
+    color_font_failed: bool = false,
 
     fn destroy(self: *FaceEntry, allocator: std.mem.Allocator) void {
+        if (color_raster.supported) {
+            if (self.color_font) |*font| font.destroy();
+        }
         if (self.face) |*face| face.deinit();
         switch (self.source) {
             // `self.blob` aliases `source.blob` for eager entries: one
@@ -104,6 +114,9 @@ pub const Raster = struct {
     allocator: std.mem.Allocator,
     library: raster_ft.Library,
     faces: std.ArrayList(FaceEntry) = .empty,
+    /// Renders COLRv1 glyphs. Its last image is what `rasterize` returned, so
+    /// it follows the same borrow rule as FreeType's glyph slot.
+    color_painter: color_raster.Painter = .{},
     /// Changes after each successful registration/replacement. Glyph cache
     /// keys contain font ids, so consumers also track this revision to avoid
     /// retaining images or outlines from a previous font at the same id.
@@ -118,6 +131,7 @@ pub const Raster = struct {
     }
 
     pub fn deinit(self: *Raster) void {
+        if (color_raster.supported) self.color_painter.deinit();
         for (self.faces.items) |*entry| entry.destroy(self.allocator);
         self.faces.deinit(self.allocator);
         self.library.deinit();
@@ -335,6 +349,14 @@ pub const Raster = struct {
         flags: glyph_cache.CacheKeyFlags,
     ) !?raster_ft.Rendered {
         const face = (try self.ensureFace(font_id)) orelse return null;
+        if (color_raster.supported) {
+            self.color_painter.releaseImage();
+            if (face.hasColor()) {
+                if (self.rasterizeColor(font_id, glyph_id, font_size, weight, x_offset, y_offset, flags)) |rendered| {
+                    return rendered;
+                }
+            }
+        }
         var load_flags: c_int = raster_ft.FT_LOAD_DEFAULT;
         if (flags.contains(glyph_cache.CacheKeyFlags.DISABLE_HINTING)) {
             load_flags |= raster_ft.FT_LOAD_NO_HINTING;
@@ -349,6 +371,35 @@ pub const Raster = struct {
             y_offset,
             fake_italic,
         );
+    }
+
+    /// A COLRv1 glyph through hb-raster; null for every other glyph, which
+    /// FreeType handles (including COLRv0 and bitmap strikes).
+    fn rasterizeColor(
+        self: *Raster,
+        font_id: u32,
+        glyph_id: u16,
+        font_size: f32,
+        weight: u16,
+        x_offset: f32,
+        y_offset: f32,
+        flags: glyph_cache.CacheKeyFlags,
+    ) ?raster_ft.Rendered {
+        const entry = for (self.faces.items) |*candidate| {
+            if (candidate.font_id == font_id) break candidate;
+        } else return null;
+        if (entry.color_font == null and !entry.color_font_failed) {
+            const blob = entry.blob orelse return null;
+            entry.color_font = color_raster.Font.create(blob.bytes, entry.index);
+            entry.color_font_failed = entry.color_font == null;
+        }
+        const font = if (entry.color_font) |*font| font else return null;
+        if (!font.hasPaint(glyph_id)) return null;
+        const skew: f32 = if (flags.contains(glyph_cache.CacheKeyFlags.FAKE_ITALIC))
+            @as(f32, @floatFromInt(raster_ft.FAKE_ITALIC_MATRIX_XY)) / 65536.0
+        else
+            0;
+        return self.color_painter.render(font, glyph_id, font_size, weight, x_offset, y_offset, skew);
     }
 
     /// Outline commands for one glyph: the real (FreeType) backend behind
@@ -385,6 +436,7 @@ pub const Raster = struct {
     fn populate(self: *Raster, entry: *FaceEntry, index: i32) !void {
         const bytes = (entry.blob orelse return error.FontUnavailable).bytes;
         entry.face = try raster_ft.Face.initMemory(&self.library, bytes, index);
+        entry.index = index;
         entry.loaded = true;
     }
 
@@ -675,6 +727,49 @@ test "rasterize applies fractional subpixel offsets" {
     try testing.expectEqual(base_w, reset.width);
     try testing.expectEqual(base_h, reset.height);
     try testing.expectEqualSlices(u8, base_copy, reset.bitmap);
+}
+
+test "rasterize renders COLRv1 glyphs in color" {
+    if (!color_raster.supported) return error.SkipZigTest;
+    const path = "/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf";
+    var raster = try Raster.init(std.testing.allocator);
+    defer raster.deinit();
+    try raster.addFontSource(1, path, 0);
+    if ((try raster.ensureFace(1)) == null) return error.SkipZigTest;
+    var font = color_raster.Font.create(raster.faces.items[0].blob.?.bytes, 0) orelse return error.SkipZigTest;
+    defer font.destroy();
+    const glyph = font.nominalGlyph(0x1F600) orelse return error.SkipZigTest;
+    if (!font.hasPaint(glyph)) return error.SkipZigTest;
+
+    const none = glyph_cache.CacheKeyFlags.empty();
+    const rendered = (try raster.rasterize(1, @intCast(glyph), 64, 400, 0, 0, none)).?;
+    try std.testing.expectEqual(raster_ft.FT_PIXEL_MODE_BGRA, rendered.pixel_mode);
+    try std.testing.expect(rendered.width > 40 and rendered.width < 100);
+    try std.testing.expect(rendered.height > 40 and rendered.height < 100);
+    try std.testing.expect(rendered.advance_x > 0);
+    // The face sits on the baseline, roughly, not somewhere else.
+    try std.testing.expect(rendered.top > 30 and rendered.top < 80);
+
+    // Upright, not flipped: going down the center column, the top half is the
+    // yellow forehead between the eyes and the lower half crosses the mouth.
+    const isYellow = struct {
+        fn f(r: raster_ft.Rendered, y: u32) bool {
+            const px = r.rowSlice(y)[(r.width / 2) * 4 ..][0..4];
+            return px[3] > 200 and px[2] > 150 and px[1] > 100 and px[0] < px[1];
+        }
+    }.f;
+    var y: u32 = rendered.height / 8;
+    while (y < rendered.height / 2) : (y += 1) try std.testing.expect(isYellow(rendered, y));
+    var mouth = false;
+    while (y < rendered.height * 7 / 8) : (y += 1) mouth = mouth or !isYellow(rendered, y);
+    try std.testing.expect(mouth);
+
+    // A subpixel pen moves the result, and a new render replaces the old one.
+    const moved = (try raster.rasterize(1, @intCast(glyph), 64, 400, 0.5, 0, none)).?;
+    try std.testing.expect(moved.width >= rendered.width);
+    // Larger sizes grow.
+    const big = (try raster.rasterize(1, @intCast(glyph), 128, 400, 0, 0, none)).?;
+    try std.testing.expect(big.width > moved.width);
 }
 
 test "rasterize applies fake italic skew and fractional sizes" {
